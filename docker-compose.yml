@@ -1,0 +1,36 @@
+﻿version: "3.9"
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: it-cons-backend
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: 8000
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: it-cons-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      PORT: 5173
+    depends_on:
+      - backend
+
+  postgres:
+    image: postgres:16
+    container_name: it-cons-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: it_cons
+      POSTGRES_USER: it_cons
+      POSTGRES_PASSWORD: it_cons
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
