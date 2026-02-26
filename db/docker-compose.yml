@@ -3,8 +3,6 @@ services:
   postgres:
     image: postgres:16
     container_name: it-cons-postgres
-    ports:
-      - "5432:5432"
     environment:
       POSTGRES_DB: it_cons
       POSTGRES_USER: it_cons

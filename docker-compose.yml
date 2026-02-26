@@ -2,12 +2,19 @@
 services:
   backend:
     build:
-      context: ./backend
+      context: ./django_backend
     container_name: it-cons-backend
     ports:
       - "8000:8000"
     environment:
-      PORT: 8000
+      DJANGO_PORT: 8000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: it_cons
+      DB_USER: it_cons
+      DB_PASSWORD: it_cons
+    depends_on:
+      - postgres
 
   frontend:
     build:
@@ -23,8 +30,6 @@ services:
   postgres:
     image: postgres:16
     container_name: it-cons-postgres
-    ports:
-      - "5432:5432"
     environment:
       POSTGRES_DB: it_cons
       POSTGRES_USER: it_cons
