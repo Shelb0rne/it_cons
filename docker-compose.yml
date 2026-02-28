@@ -6,6 +6,8 @@ services:
     container_name: it-cons-backend
     ports:
       - "8000:8000"
+    volumes:
+      - ./django_backend/media:/app/media
     environment:
       DJANGO_PORT: 8000
       DB_HOST: postgres

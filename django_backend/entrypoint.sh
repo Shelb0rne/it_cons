@@ -36,4 +36,6 @@ else:
 PY
 
 python manage.py migrate --noinput
+python manage.py ensure_default_admin
+mkdir -p /app/media/events/gallery
 exec python manage.py runserver 0.0.0.0:${DJANGO_PORT:-8000}

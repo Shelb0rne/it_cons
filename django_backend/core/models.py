@@ -273,6 +273,22 @@ class EventSession(models.Model):
         db_table = "event_session"
 
 
+class EventImage(models.Model):
+    image_id = models.BigAutoField(primary_key=True)
+    event = models.ForeignKey(
+        Event,
+        on_delete=models.CASCADE,
+        db_column="event_id",
+        related_name="images",
+    )
+    image = models.FileField(upload_to="events/gallery/")
+    sort_order = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "event_image"
+
+
 class TicketType(models.Model):
     ticket_type_id = models.BigAutoField(primary_key=True)
     session = models.ForeignKey(
