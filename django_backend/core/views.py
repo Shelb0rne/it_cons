@@ -15,11 +15,15 @@ from .models import (
     Event,
     EventImage,
     EventSession,
+    Order,
     OrganizerAccount,
     OrganizerDetails,
     OrganizerProfile,
+    Reservation,
     TicketType,
     UserAccount,
+    UserPaymentMethod,
+    UserPrivacySettings,
     Venue,
 )
 
@@ -174,7 +178,7 @@ def health(request):
 def public_events(request):
     now = timezone.now()
     events = (
-        Event.objects.all()
+        Event.objects.filter(status=Event.STATUS_PUBLISHED)
         .select_related("category", "venue")
         .prefetch_related("sessions__ticket_types")
         .order_by("event_id")
@@ -215,6 +219,18 @@ def public_events(request):
             }
         )
     return JsonResponse({"events": payload})
+
+
+@require_GET
+def public_event_detail(request, event_id):
+    event = (
+        Event.objects.filter(event_id=event_id)
+        .select_related("category", "venue")
+        .first()
+    )
+    if not event:
+        return JsonResponse({"error": "Event not found"}, status=404)
+    return JsonResponse(_event_detail_payload(request, event))
 
 
 @csrf_exempt
@@ -330,6 +346,304 @@ def auth_me(request):
         )
 
     return JsonResponse({"error": "Unsupported role"}, status=400)
+
+
+def _user_profile_payload(user):
+    return {
+        "role": "user",
+        "id": user.user_id,
+        "login": user.email or user.phone,
+        "email": user.email,
+        "phone": user.phone,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "status": user.status,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+
+
+def _user_payment_payload(method):
+    return {
+        "payment_method_id": method.payment_method_id,
+        "card_number": method.card_number,
+        "card_last4": method.card_last4,
+        "card_brand": method.card_brand,
+        "holder_name": method.holder_name,
+        "expires_at": method.expires_at,
+        "cvv_code": method.cvv_code,
+        "status": method.status,
+        "created_at": method.created_at.isoformat() if method.created_at else None,
+    }
+
+
+def _user_privacy_payload(settings):
+    return {
+        "show_profile_in_reviews": settings.show_profile_in_reviews,
+        "allow_email_notifications": settings.allow_email_notifications,
+        "allow_sms_notifications": settings.allow_sms_notifications,
+    }
+
+
+def _user_account_by_token(request):
+    token_payload, err = _require_role_token(request, "user")
+    if err:
+        return None, err
+    user = UserAccount.objects.filter(user_id=token_payload.get("id")).first()
+    if not user:
+        return None, JsonResponse({"error": "User account not found"}, status=404)
+    return user, None
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PUT"])
+def user_profile(request):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    if request.method == "GET":
+        return JsonResponse(_user_profile_payload(user))
+
+    payload = _parse_json_body(request)
+    if payload is None:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    first_name = (payload.get("first_name") if "first_name" in payload else user.first_name) or ""
+    last_name = (payload.get("last_name") if "last_name" in payload else user.last_name) or ""
+    email_raw = payload.get("email") if "email" in payload else user.email
+    phone_raw = payload.get("phone") if "phone" in payload else user.phone
+
+    first_name = first_name.strip()
+    last_name = last_name.strip()
+    email = (email_raw or "").strip() or None
+    phone = (phone_raw or "").strip() or None
+
+    if not first_name or not last_name:
+        return JsonResponse({"error": "first_name and last_name are required"}, status=400)
+    if not email and not phone:
+        return JsonResponse({"error": "email or phone is required"}, status=400)
+
+    if email and UserAccount.objects.filter(email__iexact=email).exclude(user_id=user.user_id).exists():
+        return JsonResponse({"error": "User with this email already exists"}, status=409)
+    if phone and UserAccount.objects.filter(phone=phone).exclude(user_id=user.user_id).exists():
+        return JsonResponse({"error": "User with this phone already exists"}, status=409)
+
+    user.first_name = first_name
+    user.last_name = last_name
+    user.email = email
+    user.phone = phone
+    user.save()
+
+    return JsonResponse(_user_profile_payload(user))
+
+
+@require_GET
+def user_bookings(request):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    now = timezone.now()
+
+    reservations = (
+        Reservation.objects.filter(user=user, expires_at__gte=now)
+        .prefetch_related("items__session__event__venue", "items__ticket_type")
+        .order_by("-created_at")
+    )
+    current_payload = []
+    for reservation in reservations:
+        items_payload = []
+        for item in reservation.items.all():
+            session = item.session
+            event = session.event if session else None
+            venue = event.venue if event else None
+            items_payload.append(
+                {
+                    "event_id": event.event_id if event else None,
+                    "event_title": event.title if event else "",
+                    "starts_at": session.starts_at.isoformat() if session and session.starts_at else None,
+                    "venue_name": venue.name if venue else "",
+                    "ticket_type": item.ticket_type.name if item.ticket_type else "",
+                }
+            )
+        current_payload.append(
+            {
+                "reservation_id": reservation.reservation_id,
+                "expires_at": reservation.expires_at.isoformat() if reservation.expires_at else None,
+                "created_at": reservation.created_at.isoformat() if reservation.created_at else None,
+                "items": items_payload,
+            }
+        )
+
+    orders = (
+        Order.objects.filter(user=user)
+        .prefetch_related("order_tickets__session__event__venue", "order_tickets__ticket_type")
+        .order_by("-created_at")
+    )
+    history_payload = []
+    for order in orders:
+        tickets_payload = []
+        for ticket in order.order_tickets.all():
+            session = ticket.session
+            event = session.event if session else None
+            venue = event.venue if event else None
+            tickets_payload.append(
+                {
+                    "event_id": event.event_id if event else None,
+                    "event_title": event.title if event else "",
+                    "starts_at": session.starts_at.isoformat() if session and session.starts_at else None,
+                    "venue_name": venue.name if venue else "",
+                    "ticket_type": ticket.ticket_type.name if ticket.ticket_type else "",
+                    "unit_price": str(ticket.unit_price),
+                    "currency": ticket.currency,
+                }
+            )
+        history_payload.append(
+            {
+                "order_id": order.order_id,
+                "status": order.status,
+                "total_amount": str(order.total_amount),
+                "currency": order.currency,
+                "created_at": order.created_at.isoformat() if order.created_at else None,
+                "paid_at": order.paid_at.isoformat() if order.paid_at else None,
+                "tickets": tickets_payload,
+            }
+        )
+
+    return JsonResponse({"current": current_payload, "history": history_payload})
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def user_payment_methods(request):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    if request.method == "GET":
+        items = UserPaymentMethod.objects.filter(user=user).order_by("-created_at")
+        return JsonResponse({"items": [_user_payment_payload(item) for item in items]})
+
+    payload = _parse_json_body(request)
+    if payload is None:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    card_brand = (payload.get("card_brand") or "").strip()
+    card_number = (payload.get("card_number") or "").strip()
+    holder_name = (payload.get("holder_name") or "").strip()
+    expires_at = (payload.get("expires_at") or "").strip()
+    cvv_code = (payload.get("cvv_code") or "").strip()
+
+    if not card_brand:
+        return JsonResponse({"error": "card_brand is required"}, status=400)
+    if len(card_number) != 12 or not card_number.isdigit():
+        return JsonResponse({"error": "card_number must contain exactly 12 digits"}, status=400)
+    if not holder_name:
+        return JsonResponse({"error": "holder_name is required"}, status=400)
+    if len(expires_at) != 5 or expires_at[2] != "/":
+        return JsonResponse({"error": "expires_at must be in MM/YY format"}, status=400)
+    mm, yy = expires_at.split("/")
+    if not (mm.isdigit() and yy.isdigit() and 1 <= int(mm) <= 12):
+        return JsonResponse({"error": "expires_at must be in MM/YY format"}, status=400)
+    if len(cvv_code) not in {3, 4} or not cvv_code.isdigit():
+        return JsonResponse({"error": "cvv_code must contain 3 or 4 digits"}, status=400)
+
+    method = UserPaymentMethod.objects.create(
+        user=user,
+        card_number=card_number,
+        card_last4=card_number[-4:],
+        card_brand=card_brand,
+        holder_name=holder_name,
+        expires_at=expires_at,
+        cvv_code=cvv_code,
+        status=UserPaymentMethod.STATUS_ACTIVE,
+    )
+    return JsonResponse(_user_payment_payload(method), status=201)
+
+
+@csrf_exempt
+@require_http_methods(["PUT", "DELETE"])
+def user_payment_method_detail(request, payment_method_id):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    method = UserPaymentMethod.objects.filter(
+        payment_method_id=payment_method_id,
+        user=user,
+    ).first()
+    if not method:
+        return JsonResponse({"error": "Payment method not found"}, status=404)
+
+    if request.method == "DELETE":
+        method.delete()
+        return JsonResponse({"ok": True})
+
+    payload = _parse_json_body(request)
+    if payload is None:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    if "card_brand" in payload:
+        method.card_brand = (payload.get("card_brand") or "").strip() or None
+    if "card_number" in payload:
+        card_number = (payload.get("card_number") or "").strip()
+        if len(card_number) != 12 or not card_number.isdigit():
+            return JsonResponse({"error": "card_number must contain exactly 12 digits"}, status=400)
+        method.card_number = card_number
+        method.card_last4 = card_number[-4:]
+    if "holder_name" in payload:
+        method.holder_name = (payload.get("holder_name") or "").strip() or None
+    if "expires_at" in payload:
+        expires_at = (payload.get("expires_at") or "").strip()
+        if len(expires_at) != 5 or expires_at[2] != "/":
+            return JsonResponse({"error": "expires_at must be in MM/YY format"}, status=400)
+        mm, yy = expires_at.split("/")
+        if not (mm.isdigit() and yy.isdigit() and 1 <= int(mm) <= 12):
+            return JsonResponse({"error": "expires_at must be in MM/YY format"}, status=400)
+        method.expires_at = expires_at
+    if "cvv_code" in payload:
+        cvv_code = (payload.get("cvv_code") or "").strip()
+        if len(cvv_code) not in {3, 4} or not cvv_code.isdigit():
+            return JsonResponse({"error": "cvv_code must contain 3 or 4 digits"}, status=400)
+        method.cvv_code = cvv_code
+    if "status" in payload and payload.get("status") in {
+        UserPaymentMethod.STATUS_ACTIVE,
+        UserPaymentMethod.STATUS_DISABLED,
+    }:
+        method.status = payload.get("status")
+
+    if not method.card_brand or not method.card_number or not method.holder_name or not method.expires_at or not method.cvv_code:
+        return JsonResponse({"error": "card_brand, card_number, holder_name, expires_at, cvv_code are required"}, status=400)
+
+    method.save()
+    return JsonResponse(_user_payment_payload(method))
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PUT"])
+def user_privacy(request):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    settings, _ = UserPrivacySettings.objects.get_or_create(user=user)
+
+    if request.method == "GET":
+        return JsonResponse(_user_privacy_payload(settings))
+
+    payload = _parse_json_body(request)
+    if payload is None:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    if "show_profile_in_reviews" in payload:
+        settings.show_profile_in_reviews = bool(payload.get("show_profile_in_reviews"))
+    if "allow_email_notifications" in payload:
+        settings.allow_email_notifications = bool(payload.get("allow_email_notifications"))
+    if "allow_sms_notifications" in payload:
+        settings.allow_sms_notifications = bool(payload.get("allow_sms_notifications"))
+
+    settings.save()
+    return JsonResponse(_user_privacy_payload(settings))
 
 
 @csrf_exempt
@@ -778,6 +1092,11 @@ def _create_or_update_event_from_body(profile, body, event=None):
     starts_at = (body.get("starts_at") or "").strip()
     sessions_payload = _parse_sessions_payload(body.get("sessions"), starts_at)
     ticket_types_payload = body.get("ticket_types") or []
+    if status == Event.STATUS_PUBLISHED and not sessions_payload:
+        return None, JsonResponse(
+            {"error": "At least one session is required to publish an event"},
+            status=400,
+        )
 
     if is_update:
         event.sessions.all().delete()

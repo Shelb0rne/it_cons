@@ -1,5 +1,5 @@
-<script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+﻿<script setup>
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import heroBanner from "./assets/banners/main-banner.png";
 
 const apiBase = import.meta.env.VITE_API_BASE || "http://localhost:8000";
@@ -123,6 +123,45 @@ const galleryInputRef = ref(null);
 const editingEventId = ref(null);
 const selectedOrganizerEvent = ref(null);
 const organizerEventDetailLoading = ref(false);
+const userCabinetTab = ref("profile");
+const userProfileForm = ref({
+  first_name: "",
+  last_name: "",
+  phone: "",
+  email: "",
+});
+const userProfileLoading = ref(false);
+const userProfileSaving = ref(false);
+const userProfileError = ref("");
+const userProfileSuccess = ref("");
+const userProfileEdit = ref(false);
+const userBookingsLoading = ref(false);
+const userBookingsError = ref("");
+const userCurrentBookings = ref([]);
+const userHistoryBookings = ref([]);
+const userPaymentsLoading = ref(false);
+const userPaymentsError = ref("");
+const userPaymentsSuccess = ref("");
+const userPaymentMethods = ref([]);
+const userPaymentEditId = ref(null);
+const userPaymentEditorOpen = ref(false);
+const userPaymentShowCvv = ref(false);
+const userPaymentForm = ref({
+  card_brand: "",
+  card_number: "",
+  expires_at: "",
+  holder_name: "",
+  cvv_code: "",
+});
+const userPrivacyLoading = ref(false);
+const userPrivacySaving = ref(false);
+const userPrivacyError = ref("");
+const userPrivacySuccess = ref("");
+const userPrivacyForm = ref({
+  show_profile_in_reviews: false,
+  allow_email_notifications: true,
+  allow_sms_notifications: false,
+});
 
 function persistAuth(value) {
   auth.value = value;
@@ -209,6 +248,10 @@ async function loadProfile() {
       organizerTab.value = "company";
       await loadOrganizerCompany();
       await loadOrganizerEvents();
+    } else if (payload.role === "user") {
+      userCabinetTab.value = "profile";
+      userProfileEdit.value = false;
+      await loadUserCabinetData();
     }
   } catch (error) {
     profileError.value = error instanceof Error ? error.message : String(error);
@@ -333,6 +376,34 @@ function addTicketType() {
 
 function removeTicketType(index) {
   ticketTypes.value.splice(index, 1);
+}
+
+function collectSessionsForSubmit() {
+  const prepared = [...sessions.value];
+  const draft = {
+    date: (sessionDraft.value.date || "").trim(),
+    start_time: (sessionDraft.value.start_time || "").trim(),
+    end_time: (sessionDraft.value.end_time || "").trim(),
+  };
+  const hasDraftValues = Boolean(draft.date || draft.start_time || draft.end_time);
+  if (!hasDraftValues) return prepared;
+
+  if (!draft.date || !draft.start_time) {
+    throw new Error("Чтобы добавить сеанс, заполните дату и время начала или очистите поля сеанса.");
+  }
+
+  const duplicate = prepared.some(
+    (session) =>
+      session.date === draft.date &&
+      session.start_time === draft.start_time &&
+      (session.end_time || "") === (draft.end_time || "")
+  );
+  if (!duplicate) {
+    prepared.push(draft);
+    sessions.value = prepared;
+  }
+  sessionDraft.value = { date: "", start_time: "", end_time: "" };
+  return prepared;
 }
 
 function resetEventForm() {
@@ -555,6 +626,12 @@ async function createOrganizerEvent(status = "draft") {
   if (!auth.value?.token) return;
   organizerEventsError.value = "";
   try {
+    const sessionsForSubmit = collectSessionsForSubmit();
+    if (status === "published" && sessionsForSubmit.length === 0) {
+      organizerEventsError.value = "Для публикации добавьте хотя бы один сеанс.";
+      return;
+    }
+
     const selected = ageOptions.find((a) => a.label === selectedAgeOption.value) || null;
     const isEdit = !!editingEventId.value;
     const url = isEdit
@@ -571,7 +648,7 @@ async function createOrganizerEvent(status = "draft") {
         status,
         age_min: selected?.min ?? null,
         age_max: selected?.max ?? null,
-        sessions: sessions.value,
+        sessions: sessionsForSubmit,
         ticket_types: ticketTypes.value,
       }),
     });
@@ -589,6 +666,312 @@ async function createOrganizerEvent(status = "draft") {
   } catch (error) {
     organizerEventsError.value = error instanceof Error ? error.message : String(error);
   }
+}
+
+function hydrateUserProfileForm(payload) {
+  userProfileForm.value = {
+    first_name: payload?.first_name || "",
+    last_name: payload?.last_name || "",
+    phone: payload?.phone || "",
+    email: payload?.email || "",
+  };
+}
+
+async function loadUserProfile() {
+  if (!auth.value?.token) return;
+  userProfileLoading.value = true;
+  userProfileError.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/user/profile`, {
+      headers: { Authorization: `Bearer ${auth.value.token}` },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      userProfileError.value = payload.error || "Не удалось загрузить профиль";
+      return;
+    }
+    hydrateUserProfileForm(payload);
+  } catch (error) {
+    userProfileError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    userProfileLoading.value = false;
+  }
+}
+
+async function saveUserProfile() {
+  if (!auth.value?.token) return;
+  userProfileSaving.value = true;
+  userProfileError.value = "";
+  userProfileSuccess.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/user/profile`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+      body: JSON.stringify(userProfileForm.value),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      userProfileError.value = payload.error || "Не удалось сохранить профиль";
+      return;
+    }
+    hydrateUserProfileForm(payload);
+    profile.value = { ...profile.value, ...payload };
+    userProfileEdit.value = false;
+    userProfileSuccess.value = "Профиль сохранен";
+  } catch (error) {
+    userProfileError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    userProfileSaving.value = false;
+  }
+}
+
+async function loadUserBookings() {
+  if (!auth.value?.token) return;
+  userBookingsLoading.value = true;
+  userBookingsError.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/user/bookings`, {
+      headers: { Authorization: `Bearer ${auth.value.token}` },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      userBookingsError.value = payload.error || "Не удалось загрузить бронирования";
+      return;
+    }
+    userCurrentBookings.value = payload.current || [];
+    userHistoryBookings.value = payload.history || [];
+  } catch (error) {
+    userBookingsError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    userBookingsLoading.value = false;
+  }
+}
+
+function resetUserPaymentForm() {
+  userPaymentEditId.value = null;
+  userPaymentShowCvv.value = false;
+  userPaymentForm.value = {
+    card_brand: "",
+    card_number: "",
+    expires_at: "",
+    holder_name: "",
+    cvv_code: "",
+  };
+}
+
+function openAddPaymentEditor() {
+  resetUserPaymentForm();
+  userPaymentEditorOpen.value = true;
+}
+
+function startEditUserPayment(method) {
+  userPaymentEditId.value = method.payment_method_id;
+  userPaymentShowCvv.value = false;
+  userPaymentForm.value = {
+    card_brand: method.card_brand || "",
+    card_number: method.card_number || "",
+    expires_at: method.expires_at || "",
+    holder_name: method.holder_name || "",
+    cvv_code: method.cvv_code || "",
+  };
+  userPaymentEditorOpen.value = true;
+  userPaymentsSuccess.value = "";
+}
+
+async function loadUserPaymentMethods() {
+  if (!auth.value?.token) return;
+  userPaymentsLoading.value = true;
+  userPaymentsError.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/user/payment-methods`, {
+      headers: { Authorization: `Bearer ${auth.value.token}` },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      userPaymentsError.value = payload.error || "Не удалось загрузить платежные данные";
+      return;
+    }
+    userPaymentMethods.value = payload.items || [];
+  } catch (error) {
+    userPaymentsError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    userPaymentsLoading.value = false;
+  }
+}
+
+async function saveUserPaymentMethod() {
+  if (!auth.value?.token) return;
+  userPaymentsError.value = "";
+  userPaymentsSuccess.value = "";
+  const form = {
+    card_brand: (userPaymentForm.value.card_brand || "").trim(),
+    card_number: (userPaymentForm.value.card_number || "").trim(),
+    expires_at: (userPaymentForm.value.expires_at || "").trim(),
+    holder_name: (userPaymentForm.value.holder_name || "").trim(),
+    cvv_code: (userPaymentForm.value.cvv_code || "").trim(),
+  };
+  if (!form.card_brand) {
+    userPaymentsError.value = "Укажите название банка/карты";
+    return;
+  }
+  if (!/^\d{12}$/.test(form.card_number)) {
+    userPaymentsError.value = "Номер карты должен содержать 12 цифр";
+    return;
+  }
+  if (!/^\d{2}\/\d{2}$/.test(form.expires_at)) {
+    userPaymentsError.value = "Срок действия укажите в формате MM/YY";
+    return;
+  }
+  if (!form.holder_name) {
+    userPaymentsError.value = "Укажите ФИО владельца карты";
+    return;
+  }
+  if (!/^\d{3,4}$/.test(form.cvv_code)) {
+    userPaymentsError.value = "CVV должен содержать 3 или 4 цифры";
+    return;
+  }
+
+  userPaymentsLoading.value = true;
+  try {
+    const isEdit = !!userPaymentEditId.value;
+    const url = isEdit
+      ? `${apiBase}/api/user/payment-methods/${userPaymentEditId.value}`
+      : `${apiBase}/api/user/payment-methods`;
+    const response = await fetch(url, {
+      method: isEdit ? "PUT" : "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+      body: JSON.stringify(form),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      userPaymentsError.value = payload.error || "Не удалось сохранить способ оплаты";
+      return;
+    }
+    await loadUserPaymentMethods();
+    userPaymentsSuccess.value = isEdit ? "Способ оплаты обновлен" : "Способ оплаты добавлен";
+    userPaymentEditorOpen.value = false;
+    resetUserPaymentForm();
+  } catch (error) {
+    userPaymentsError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    userPaymentsLoading.value = false;
+  }
+}
+
+async function deleteUserPaymentMethod(paymentMethodId) {
+  if (!auth.value?.token) return;
+  userPaymentsError.value = "";
+  userPaymentsSuccess.value = "";
+  userPaymentsLoading.value = true;
+  try {
+    const response = await fetch(`${apiBase}/api/user/payment-methods/${paymentMethodId}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      userPaymentsError.value = payload.error || "Не удалось удалить способ оплаты";
+      return;
+    }
+    if (userPaymentEditId.value === paymentMethodId) {
+      resetUserPaymentForm();
+    }
+    await loadUserPaymentMethods();
+    userPaymentsSuccess.value = "Способ оплаты удален";
+  } catch (error) {
+    userPaymentsError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    userPaymentsLoading.value = false;
+  }
+}
+
+async function loadUserPrivacy() {
+  if (!auth.value?.token) return;
+  userPrivacyLoading.value = true;
+  userPrivacyError.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/user/privacy`, {
+      headers: { Authorization: `Bearer ${auth.value.token}` },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      userPrivacyError.value = payload.error || "Не удалось загрузить настройки конфиденциальности";
+      return;
+    }
+    userPrivacyForm.value = {
+      show_profile_in_reviews: !!payload.show_profile_in_reviews,
+      allow_email_notifications: !!payload.allow_email_notifications,
+      allow_sms_notifications: !!payload.allow_sms_notifications,
+    };
+  } catch (error) {
+    userPrivacyError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    userPrivacyLoading.value = false;
+  }
+}
+
+async function saveUserPrivacy() {
+  if (!auth.value?.token) return;
+  userPrivacySaving.value = true;
+  userPrivacyError.value = "";
+  userPrivacySuccess.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/user/privacy`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+      body: JSON.stringify(userPrivacyForm.value),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      userPrivacyError.value = payload.error || "Не удалось сохранить настройки конфиденциальности";
+      return;
+    }
+    userPrivacyForm.value = {
+      show_profile_in_reviews: !!payload.show_profile_in_reviews,
+      allow_email_notifications: !!payload.allow_email_notifications,
+      allow_sms_notifications: !!payload.allow_sms_notifications,
+    };
+    userPrivacySuccess.value = "Настройки конфиденциальности сохранены";
+  } catch (error) {
+    userPrivacyError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    userPrivacySaving.value = false;
+  }
+}
+
+async function loadUserCabinetData() {
+  userProfileSuccess.value = "";
+  userPaymentsSuccess.value = "";
+  userPrivacySuccess.value = "";
+  userPaymentEditorOpen.value = false;
+  resetUserPaymentForm();
+  await loadUserProfile();
+  await loadUserBookings();
+  await loadUserPaymentMethods();
+  await loadUserPrivacy();
+}
+
+function formatCabinetDate(isoDate) {
+  if (!isoDate) return "Дата уточняется";
+  const dt = new Date(isoDate);
+  if (Number.isNaN(dt.getTime())) return "Дата уточняется";
+  return dt.toLocaleString("ru-RU", {
+    day: "numeric",
+    month: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 async function submitCreateUser() {
@@ -625,6 +1008,17 @@ async function submitCreateUser() {
 }
 
 function handleRoute() {
+  if (currentPath.value === "/") {
+    loadPublicEvents();
+    return;
+  }
+
+  const publicEventId = getEventIdFromPath(currentPath.value);
+  if (publicEventId) {
+    loadPublicEventDetail(publicEventId);
+    return;
+  }
+
   if (currentPath.value === "/cabinet") {
     if (!auth.value) {
       navigate("/login");
@@ -655,6 +1049,9 @@ const calendarStep = ref(54);
 const events = ref([]);
 const publicEventsLoading = ref(false);
 const publicEventsError = ref("");
+const publicEventLoading = ref(false);
+const publicEventError = ref("");
+const publicEvent = ref(null);
 
 const filteredEvents = computed(() => {
   const q = search.value.trim().toLowerCase();
@@ -674,6 +1071,104 @@ function formatEventDateTime(isoDate) {
     minute: "2-digit",
   });
 }
+
+function formatEventDetailDate(isoDate) {
+  if (!isoDate) return "Дата уточняется";
+  return new Date(isoDate).toLocaleString("ru-RU", {
+    day: "numeric",
+    month: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function eventPrimarySession(eventPayload) {
+  const sessionsList = Array.isArray(eventPayload?.sessions) ? eventPayload.sessions : [];
+  const parsed = sessionsList
+    .map((session) => ({
+      ...session,
+      ts: Date.parse(session?.starts_at || ""),
+    }))
+    .filter((session) => Number.isFinite(session.ts))
+    .sort((a, b) => a.ts - b.ts);
+  if (!parsed.length) return null;
+  const now = Date.now();
+  const upcoming = parsed.find((session) => session.ts >= now);
+  return upcoming || parsed[0];
+}
+
+function eventMinPrice(eventPayload) {
+  const sessionsList = Array.isArray(eventPayload?.sessions) ? eventPayload.sessions : [];
+  let minPrice = null;
+  sessionsList.forEach((session) => {
+    (session?.ticket_types || []).forEach((ticket) => {
+      const value = Number(ticket?.price);
+      if (!Number.isFinite(value)) return;
+      if (minPrice === null || value < minPrice) {
+        minPrice = value;
+      }
+    });
+  });
+  return minPrice;
+}
+
+function formatPriceRu(value) {
+  if (value == null) return "Цена уточняется";
+  return `от ${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(value)} ₽`;
+}
+
+function eventAgeLabel(eventPayload) {
+  if (!eventPayload) return "Для всей семьи";
+  if (eventPayload.age_min == null && eventPayload.age_max == null) return "Для всей семьи";
+  if (eventPayload.age_max == null) return `${eventPayload.age_min}+`;
+  return `${eventPayload.age_min}-${eventPayload.age_max}`;
+}
+
+const activePublicSession = computed(() => eventPrimarySession(publicEvent.value));
+const activePublicMinPrice = computed(() => eventMinPrice(publicEvent.value));
+const eventInfoTab = ref("description");
+
+const currentEventReviews = computed(() =>
+  Array.isArray(publicEvent.value?.reviews) ? publicEvent.value.reviews : []
+);
+
+const reviewsAverage = computed(() => {
+  if (!currentEventReviews.value.length) return null;
+  const sum = currentEventReviews.value.reduce((acc, review) => acc + (Number(review.rating) || 0), 0);
+  return sum / currentEventReviews.value.length;
+});
+
+const reviewsDistribution = computed(() => {
+  const base = [5, 4, 3, 2, 1].map((stars) => ({ stars, count: 0 }));
+  currentEventReviews.value.forEach((review) => {
+    const rating = Math.max(1, Math.min(5, Math.round(Number(review.rating) || 0)));
+    const row = base.find((item) => item.stars === rating);
+    if (row) row.count += 1;
+  });
+  return base;
+});
+
+const reviewsMaxCount = computed(() =>
+  reviewsDistribution.value.reduce((max, row) => Math.max(max, row.count), 0)
+);
+
+function formatReviewDate(isoDate) {
+  if (!isoDate) return "";
+  const dt = new Date(isoDate);
+  if (Number.isNaN(dt.getTime())) return "";
+  return dt.toLocaleDateString("ru-RU", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
+watch(
+  () => publicEvent.value?.event_id,
+  () => {
+    eventInfoTab.value = "description";
+  }
+);
 
 async function fetchJsonWithRetry(url, options = {}, retries = 3, delayMs = 700) {
   let lastError = null;
@@ -713,6 +1208,30 @@ async function loadPublicEvents() {
     publicEventsError.value = error instanceof Error ? error.message : String(error);
   } finally {
     publicEventsLoading.value = false;
+  }
+}
+
+function getEventIdFromPath(path) {
+  const match = path.match(/^\/event\/(\d+)$/);
+  return match ? Number(match[1]) : null;
+}
+
+async function loadPublicEventDetail(eventId) {
+  if (!eventId) return;
+  publicEventLoading.value = true;
+  publicEventError.value = "";
+  publicEvent.value = null;
+  try {
+    const { response, payload } = await fetchJsonWithRetry(`${apiBase}/api/events/${eventId}`);
+    if (!response.ok) {
+      publicEventError.value = payload.error || "Не удалось загрузить мероприятие";
+      return;
+    }
+    publicEvent.value = payload;
+  } catch (error) {
+    publicEventError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    publicEventLoading.value = false;
   }
 }
 
@@ -829,6 +1348,41 @@ function scrollCalendar(direction) {
 let onPopState = null;
 let onCalendarScroll = null;
 let onWindowResize = null;
+let boundCalendarTrack = null;
+
+function detachCalendarListeners() {
+  if (boundCalendarTrack && onCalendarScroll) {
+    boundCalendarTrack.removeEventListener("scroll", onCalendarScroll);
+  }
+  if (onWindowResize) {
+    window.removeEventListener("resize", onWindowResize);
+  }
+  boundCalendarTrack = null;
+  onCalendarScroll = null;
+  onWindowResize = null;
+}
+
+async function attachCalendarListenersIfNeeded() {
+  if (currentPath.value !== "/") {
+    detachCalendarListeners();
+    return;
+  }
+  await nextTick();
+  if (!calendarTrack.value) return;
+
+  if (boundCalendarTrack === calendarTrack.value && onCalendarScroll && onWindowResize) {
+    updateStickyMonth();
+    return;
+  }
+
+  detachCalendarListeners();
+  onCalendarScroll = () => updateStickyMonth();
+  onWindowResize = () => updateStickyMonth();
+  calendarTrack.value.addEventListener("scroll", onCalendarScroll, { passive: true });
+  window.addEventListener("resize", onWindowResize);
+  boundCalendarTrack = calendarTrack.value;
+  updateStickyMonth();
+}
 
 onMounted(async () => {
   await nextTick();
@@ -838,24 +1392,17 @@ onMounted(async () => {
   };
   window.addEventListener("popstate", onPopState);
 
-  if (calendarTrack.value) {
-    onCalendarScroll = () => updateStickyMonth();
-    onWindowResize = () => updateStickyMonth();
-    calendarTrack.value.addEventListener("scroll", onCalendarScroll, { passive: true });
-    window.addEventListener("resize", onWindowResize);
-    updateStickyMonth();
-  }
-
   handleRoute();
-  await loadPublicEvents();
+  await attachCalendarListenersIfNeeded();
+});
+
+watch(currentPath, async () => {
+  await attachCalendarListenersIfNeeded();
 });
 
 onUnmounted(() => {
   if (onPopState) window.removeEventListener("popstate", onPopState);
-  if (calendarTrack.value && onCalendarScroll) {
-    calendarTrack.value.removeEventListener("scroll", onCalendarScroll);
-  }
-  if (onWindowResize) window.removeEventListener("resize", onWindowResize);
+  detachCalendarListeners();
 });
 </script>
 
@@ -963,7 +1510,12 @@ onUnmounted(() => {
         <p v-if="publicEventsLoading">Загрузка мероприятий...</p>
         <p v-else-if="publicEventsError" class="error">{{ publicEventsError }}</p>
         <template v-else-if="filteredEvents.length">
-          <article v-for="event in filteredEvents" :key="event.id" class="card main-event-card">
+          <article
+            v-for="event in filteredEvents"
+            :key="event.id"
+            class="card main-event-card clickable"
+            @click="navigate(`/event/${event.id}`)"
+          >
             <img
               v-if="event.cover_image_url"
               class="poster"
@@ -980,6 +1532,136 @@ onUnmounted(() => {
           <div class="poster poster-1"></div>
           <h2>События не найдены</h2>
         </article>
+      </section>
+    </main>
+
+    <main v-else-if="currentPath.startsWith('/event/')" class="screen event-screen">
+      <header class="header">
+        <div class="logo-wrap" @click="navigate('/')" style="cursor: pointer;">
+          <span class="logo-star" aria-hidden="true"></span>
+          <div class="logo-text">Путь</div>
+        </div>
+
+        <div class="search-box">
+          <span class="search-icon">⌕</span>
+          <input v-model="search" type="text" placeholder="Событие, Персона, Площадка" />
+        </div>
+
+        <div class="right-controls">
+          <div class="city">{{ city }}</div>
+          <button
+            class="icon-btn"
+            title="Личный кабинет"
+            aria-label="Личный кабинет"
+            @click="openCabinetFromHeader"
+          >
+            <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="8" r="3.5" />
+              <path d="M5 19a7 7 0 0 1 14 0" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <p v-if="publicEventLoading">Загрузка мероприятия...</p>
+      <p v-else-if="publicEventError" class="error">{{ publicEventError }}</p>
+      <section v-else-if="publicEvent" class="event-detail-page">
+        <button class="link-btn" @click="navigate('/')">← На главную</button>
+
+        <h1 class="event-title">{{ publicEvent.title }}</h1>
+
+        <div class="event-top-grid">
+          <img
+            v-if="publicEvent.cover_image_url"
+            :src="publicEvent.cover_image_url"
+            class="event-cover-large"
+            alt="cover"
+          />
+          <div v-else class="event-cover-large no-cover">Без фото</div>
+
+          <aside class="event-side">
+            <div class="event-chip">{{ publicEvent.category_name || "Событие" }}</div>
+            <div class="event-row"><b>Возраст:</b> {{ eventAgeLabel(publicEvent) }}</div>
+            <div class="event-row"><b>Цена:</b> {{ formatPriceRu(activePublicMinPrice) }}</div>
+            <div class="event-row"><b>Город:</b> {{ publicEvent.venue_city || "-" }}</div>
+            <div class="event-row"><b>Адрес:</b> {{ publicEvent.venue_address || "-" }}</div>
+            <div class="event-row">
+              <b>Дата:</b>
+              {{ activePublicSession ? formatEventDetailDate(activePublicSession.starts_at) : "Дата уточняется" }}
+            </div>
+            <button class="yellow-btn tickets-btn">Выбрать билеты</button>
+          </aside>
+        </div>
+
+        <section class="event-tabs-row">
+          <button
+            class="event-tab-btn"
+            :class="{ active: eventInfoTab === 'description' }"
+            @click="eventInfoTab = 'description'"
+          >
+            Описание
+          </button>
+          <button
+            class="event-tab-btn"
+            :class="{ active: eventInfoTab === 'reviews' }"
+            @click="eventInfoTab = 'reviews'"
+          >
+            Отзывы
+          </button>
+        </section>
+
+        <section class="event-description-block">
+          <template v-if="eventInfoTab === 'description'">
+            <h2>Описание</h2>
+            <p class="long-text">{{ publicEvent.description || "Описание отсутствует" }}</p>
+          </template>
+
+          <template v-else>
+            <h2>Отзывы</h2>
+            <div class="reviews-head">
+              <div class="reviews-summary">
+                <div class="reviews-average">
+                  {{ reviewsAverage == null ? "—" : reviewsAverage.toFixed(1) }}
+                </div>
+                <div class="reviews-count">
+                  {{ currentEventReviews.length ? `На основе ${currentEventReviews.length} оценок` : "Пока нет оценок" }}
+                </div>
+              </div>
+              <div class="reviews-bars">
+                <div v-for="row in reviewsDistribution" :key="row.stars" class="reviews-bar-row">
+                  <div class="stars-label">{{ "★".repeat(row.stars) }}</div>
+                  <div class="bar-track">
+                    <div
+                      class="bar-fill"
+                      :style="{ width: `${reviewsMaxCount ? (row.count / reviewsMaxCount) * 100 : 0}%` }"
+                    ></div>
+                  </div>
+                  <div class="bar-count">{{ row.count }}</div>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="!currentEventReviews.length" class="reviews-empty">
+              Отзывов по этому мероприятию пока нет.
+            </div>
+
+            <div v-else class="reviews-list">
+              <article v-for="(review, idx) in currentEventReviews" :key="review.review_id || idx" class="review-card">
+                <div class="review-top">
+                  <div class="review-author">{{ review.author_name || "Пользователь" }}</div>
+                  <div class="review-date">{{ formatReviewDate(review.created_at) }}</div>
+                </div>
+                <div class="review-rating">{{ "★".repeat(Math.max(1, Math.min(5, Math.round(Number(review.rating) || 0)))) }}</div>
+                <p class="review-text">{{ review.text || "Без текста" }}</p>
+              </article>
+            </div>
+          </template>
+        </section>
+
+        <section class="event-nearby-block">
+          <h2 class="nearby-title">Места рядом</h2>
+          <div class="empty-nearby"></div>
+        </section>
       </section>
     </main>
 
@@ -1118,7 +1800,7 @@ onUnmounted(() => {
                   <div v-for="(session, idx) in sessions" :key="`${session.date}-${idx}`" class="session-item">
                     <span>{{ formatSessionDate(session.date) }}</span>
                     <span>{{ formatSessionRange(session.start_time, session.end_time) }}</span>
-                    <button class="mini-link" @click="removeSession(idx)" aria-label="Удалить сеанс">🗑</button>
+                    <button class="mini-link" @click="removeSession(idx)" aria-label="Удалить сеанс">✕</button>
                   </div>
                 </div>
                 <div class="session-grid">
@@ -1141,8 +1823,8 @@ onUnmounted(() => {
                 <div v-if="ticketTypes.length" class="sessions-list">
                   <div v-for="(ticket, idx) in ticketTypes" :key="`${ticket.name}-${idx}`" class="session-item">
                     <span>{{ ticket.name }}</span>
-                    <span>{{ ticket.price }} {{ ticket.currency }} / {{ ticket.qty_total || "∞" }}</span>
-                    <button class="mini-link" @click="removeTicketType(idx)" aria-label="Удалить билет">🗑</button>
+                    <span>{{ ticket.price }} {{ ticket.currency }} / {{ ticket.qty_total || "в€ћ" }}</span>
+                    <button class="mini-link" @click="removeTicketType(idx)" aria-label="Удалить билет">✕</button>
                   </div>
                 </div>
                 <div class="ticket-grid">
@@ -1166,7 +1848,7 @@ onUnmounted(() => {
                   <input ref="coverInputRef" type="file" accept="image/*" @change="onPickCoverFile" />
                   <span>Загрузите главное фото</span>
                   <div v-if="eventCoverPreview" class="preview-wrap cover-wrap">
-                    <button class="preview-remove" @click.prevent="removeCoverImage">×</button>
+                    <button class="preview-remove" @click.prevent="removeCoverImage">вњ•</button>
                     <img :src="eventCoverPreview" class="upload-preview cover" alt="cover" />
                   </div>
                 </label>
@@ -1183,7 +1865,7 @@ onUnmounted(() => {
                   <span>Загрузите до 5 фото галереи</span>
                   <div v-if="eventGalleryItems.length" class="upload-gallery">
                     <div v-for="(img, idx) in eventGalleryItems" :key="`${img.url}-${idx}`" class="preview-wrap">
-                      <button class="preview-remove" @click.prevent="removeGalleryImage(idx)">×</button>
+                      <button class="preview-remove" @click.prevent="removeGalleryImage(idx)">вњ•</button>
                       <img :src="img.url" class="upload-preview" alt="gallery" />
                     </div>
                   </div>
@@ -1221,7 +1903,7 @@ onUnmounted(() => {
                     class="event-card-cover"
                   />
                   <div v-else class="event-card-cover no-cover">Без фото</div>
-                  <div class="event-title">{{ event.title }}</div>
+                  <div class="event-card-title">{{ event.title }}</div>
                   <div class="event-meta">
                     Статус: {{ event.status }}
                   </div>
@@ -1339,6 +2021,235 @@ onUnmounted(() => {
           </div>
         </div>
 
+      </section>
+
+      <section v-else-if="profile?.role === 'user'" class="admin-cabinet">
+        <div class="cabinet-top">
+          <div class="cabinet-breadcrumb">
+            <button class="crumb-link" @click="navigate('/')">Главная</button>
+            <span>- Личный кабинет</span>
+          </div>
+          <button class="link-btn top-exit" @click="logout">Выйти</button>
+        </div>
+        <h1 class="cabinet-title">Личный кабинет</h1>
+        <p v-if="profileLoading || userProfileLoading || userBookingsLoading || userPaymentsLoading || userPrivacyLoading">Загрузка профиля...</p>
+        <p v-if="profileError" class="error">{{ profileError }}</p>
+        <p v-if="userProfileError" class="error">{{ userProfileError }}</p>
+        <p v-if="userBookingsError" class="error">{{ userBookingsError }}</p>
+        <p v-if="userPaymentsError" class="error">{{ userPaymentsError }}</p>
+        <p v-if="userPrivacyError" class="error">{{ userPrivacyError }}</p>
+        <p v-if="userProfileSuccess" class="success">{{ userProfileSuccess }}</p>
+        <p v-if="userPaymentsSuccess" class="success">{{ userPaymentsSuccess }}</p>
+        <p v-if="userPrivacySuccess" class="success">{{ userPrivacySuccess }}</p>
+
+        <div class="cabinet-grid">
+          <aside class="cabinet-menu">
+            <button
+              class="cabinet-menu-item"
+              :class="{ active: userCabinetTab === 'profile' }"
+              @click="userCabinetTab = 'profile'"
+            >
+              Профиль
+            </button>
+            <button
+              class="cabinet-menu-item"
+              :class="{ active: userCabinetTab === 'current' }"
+              @click="userCabinetTab = 'current'"
+            >
+              Текущие бронирования
+            </button>
+            <button
+              class="cabinet-menu-item"
+              :class="{ active: userCabinetTab === 'history' }"
+              @click="userCabinetTab = 'history'"
+            >
+              История бронирований
+            </button>
+            <button
+              class="cabinet-menu-item"
+              :class="{ active: userCabinetTab === 'payments' }"
+              @click="userCabinetTab = 'payments'"
+            >
+              Платежные данные
+            </button>
+            <button
+              class="cabinet-menu-item"
+              :class="{ active: userCabinetTab === 'privacy' }"
+              @click="userCabinetTab = 'privacy'"
+            >
+              Конфиденциальность
+            </button>
+          </aside>
+
+          <div class="cabinet-content">
+            <section v-if="userCabinetTab === 'profile'" class="cabinet-block">
+              <div class="cabinet-block-head">
+                <h2>Профиль</h2>
+                <button class="link-btn" @click="userProfileEdit = !userProfileEdit">
+                  {{ userProfileEdit ? "Отмена" : "Изменить" }}
+                </button>
+              </div>
+              <div class="row-line"></div>
+              <div class="cabinet-info-grid">
+                <div>Имя</div>
+                <div v-if="!userProfileEdit">{{ userProfileForm.first_name || "-" }}</div>
+                <input v-else v-model="userProfileForm.first_name" type="text" />
+                <div>Фамилия</div>
+                <div v-if="!userProfileEdit">{{ userProfileForm.last_name || "-" }}</div>
+                <input v-else v-model="userProfileForm.last_name" type="text" />
+                <div>Телефон</div>
+                <div v-if="!userProfileEdit">{{ userProfileForm.phone || "-" }}</div>
+                <input v-else v-model="userProfileForm.phone" type="text" />
+                <div>Почта</div>
+                <div v-if="!userProfileEdit">{{ userProfileForm.email || "-" }}</div>
+                <input v-else v-model="userProfileForm.email" type="email" />
+              </div>
+              <button v-if="userProfileEdit" class="auth-submit" :disabled="userProfileSaving" @click="saveUserProfile">
+                {{ userProfileSaving ? "Сохраняем..." : "Сохранить" }}
+              </button>
+            </section>
+
+            <section v-if="userCabinetTab === 'current'" class="cabinet-block">
+              <div class="cabinet-block-head">
+                <h2>Текущие бронирования</h2>
+              </div>
+              <div class="row-line"></div>
+              <p v-if="!userCurrentBookings.length">Пока нет текущих бронирований</p>
+              <div v-else class="booking-list">
+                <article v-for="booking in userCurrentBookings" :key="`res-${booking.reservation_id}`" class="booking-card">
+                  <div class="booking-head">
+                    <div>Бронирование #{{ booking.reservation_id }}</div>
+                    <div class="booking-muted">До {{ formatCabinetDate(booking.expires_at) }}</div>
+                  </div>
+                  <div v-for="(item, idx) in booking.items" :key="`res-${booking.reservation_id}-${idx}`" class="booking-item-row">
+                    <div class="booking-item-title">{{ item.event_title || "Событие" }}</div>
+                    <div class="booking-muted">{{ formatCabinetDate(item.starts_at) }} В· {{ item.venue_name || "-" }}</div>
+                    <div class="booking-muted">{{ item.ticket_type || "Билет" }}</div>
+                  </div>
+                </article>
+              </div>
+            </section>
+
+            <section v-if="userCabinetTab === 'history'" class="cabinet-block">
+              <div class="cabinet-block-head">
+                <h2>История бронирований</h2>
+              </div>
+              <div class="row-line"></div>
+              <p v-if="!userHistoryBookings.length">Пока нет завершенных бронирований</p>
+              <div v-else class="booking-list">
+                <article v-for="order in userHistoryBookings" :key="`ord-${order.order_id}`" class="booking-card">
+                  <div class="booking-head">
+                    <div>Заказ #{{ order.order_id }}</div>
+                    <div class="booking-muted">
+                      {{ order.total_amount }} {{ order.currency }} В· {{ order.status }}
+                    </div>
+                  </div>
+                  <div class="booking-muted">Создан: {{ formatCabinetDate(order.created_at) }}</div>
+                  <div v-for="(ticket, idx) in order.tickets" :key="`ord-${order.order_id}-${idx}`" class="booking-item-row">
+                    <div class="booking-item-title">{{ ticket.event_title || "Событие" }}</div>
+                    <div class="booking-muted">{{ formatCabinetDate(ticket.starts_at) }} В· {{ ticket.venue_name || "-" }}</div>
+                    <div class="booking-muted">{{ ticket.ticket_type || "Билет" }} · {{ ticket.unit_price }} {{ ticket.currency }}</div>
+                  </div>
+                </article>
+              </div>
+            </section>
+
+            <section v-if="userCabinetTab === 'payments'" class="cabinet-block">
+              <div class="cabinet-block-head">
+                <h2>Платежные данные</h2>
+                <button class="auth-submit" @click="openAddPaymentEditor">Добавить карту</button>
+              </div>
+              <div class="row-line"></div>
+
+              <div v-if="userPaymentEditorOpen" class="payment-form">
+                <label>
+                  Название банка/карты
+                  <input v-model="userPaymentForm.card_brand" type="text" placeholder="Например: Альфа Банк" />
+                </label>
+                <label>
+                  Номер карты (12 цифр)
+                  <input v-model="userPaymentForm.card_number" type="text" maxlength="12" placeholder="000000000000" />
+                </label>
+                <div class="payment-form-grid">
+                  <label>
+                    Действителен до
+                    <input v-model="userPaymentForm.expires_at" type="text" maxlength="5" placeholder="MM/YY" />
+                  </label>
+                  <label>
+                    CVV
+                    <div class="cvv-wrap">
+                      <input
+                        v-model="userPaymentForm.cvv_code"
+                        :type="userPaymentShowCvv ? 'text' : 'password'"
+                        maxlength="4"
+                        placeholder="***"
+                      />
+                      <button class="link-btn" @click="userPaymentShowCvv = !userPaymentShowCvv">
+                        {{ userPaymentShowCvv ? "Скрыть" : "Показать" }}
+                      </button>
+                    </div>
+                  </label>
+                </div>
+                <label>
+                  ФИО владельца карты
+                  <input v-model="userPaymentForm.holder_name" type="text" placeholder="Иванов Иван Иванович" />
+                </label>
+                <div class="payment-form-actions">
+                  <button class="auth-submit" :disabled="userPaymentsLoading" @click="saveUserPaymentMethod">
+                    {{ userPaymentEditId ? "Изменить существующий" : "Добавить карту" }}
+                  </button>
+                  <button class="link-btn" @click="userPaymentEditorOpen = false; resetUserPaymentForm()">
+                    Отменить
+                  </button>
+                </div>
+              </div>
+
+              <div class="payment-cards">
+                <article
+                  v-for="method in userPaymentMethods"
+                  :key="`pm-${method.payment_method_id}`"
+                  class="payment-card"
+                >
+                  <div class="payment-card-main">
+                    <h3>{{ method.card_brand || "Банковская карта" }}</h3>
+                    <p>**** **** **** {{ method.card_last4 || "0000" }}</p>
+                  </div>
+                  <div class="payment-card-actions">
+                    <button class="link-btn" @click="startEditUserPayment(method)">Изменить существующий</button>
+                    <button class="link-btn danger-link" @click="deleteUserPaymentMethod(method.payment_method_id)">
+                      Удалить способ оплаты
+                    </button>
+                  </div>
+                </article>
+                <p v-if="!userPaymentMethods.length" class="booking-muted">Пока нет добавленных карт</p>
+              </div>
+            </section>
+
+            <section v-if="userCabinetTab === 'privacy'" class="cabinet-block">
+              <div class="cabinet-block-head">
+                <h2>Конфиденциальность</h2>
+              </div>
+              <div class="row-line"></div>
+              <div class="privacy-options">
+                <label class="privacy-option">
+                  <input v-model="userPrivacyForm.show_profile_in_reviews" type="checkbox" />
+                  <span>Показывать профиль в отзывах</span>
+                </label>
+                <label class="privacy-option">
+                  <input v-model="userPrivacyForm.allow_email_notifications" type="checkbox" />
+                  <span>Разрешить email-уведомления</span>
+                </label>
+                <label class="privacy-option">
+                  <input v-model="userPrivacyForm.allow_sms_notifications" type="checkbox" />
+                  <span>Разрешить SMS-уведомления</span>
+                </label>
+              </div>
+              <button class="auth-submit" :disabled="userPrivacySaving" @click="saveUserPrivacy">
+                {{ userPrivacySaving ? "Сохраняем..." : "Сохранить" }}
+              </button>
+            </section>
+          </div>
+        </div>
       </section>
 
       <section v-else-if="profile?.role === 'admin'" class="auth-card admin-card">
@@ -1662,8 +2573,8 @@ onUnmounted(() => {
   font-weight: 300;
   white-space: nowrap;
   color: #2f2f35;
-  background: #f8f8f8;
-  padding-right: 12px;
+  background: transparent;
+  padding-right: 4px;
 }
 
 .calendar-track {
@@ -1683,7 +2594,7 @@ onUnmounted(() => {
   font-size: 24px;
   line-height: 1;
   font-weight: 300;
-  background: #f8f8f8;
+  background: transparent;
   padding: 0 14px 2px 0;
   pointer-events: none;
   white-space: nowrap;
@@ -1813,6 +2724,235 @@ onUnmounted(() => {
   border-radius: 24px;
   padding: 12px;
   background: #fff;
+}
+
+.clickable {
+  cursor: pointer;
+}
+
+.event-detail-page {
+  margin-top: 12px;
+  display: grid;
+  gap: 16px;
+}
+
+.event-title {
+  margin: 0;
+  font-size: clamp(46px, 5vw, 74px);
+  font-weight: 400;
+  line-height: 1.02;
+  max-width: 980px;
+}
+
+.event-top-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(380px, 440px);
+  gap: 20px;
+  align-items: start;
+}
+
+.event-cover-large {
+  width: 100%;
+  max-height: 470px;
+  object-fit: cover;
+  border-radius: 24px;
+  border: 1px solid #e6e6e6;
+  background: #f3f3f3;
+}
+
+.event-side {
+  background: #f4f4f4;
+  border-radius: 16px;
+  border: 1px solid #e4e4e4;
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.event-chip {
+  display: inline-flex;
+  width: fit-content;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: #ffd039;
+  font-weight: 700;
+}
+
+.event-row {
+  font-size: 18px;
+}
+
+.tickets-btn {
+  margin-top: 6px;
+}
+
+.event-tabs-row {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+}
+
+.event-tab-btn {
+  border: 1px solid #d7d7d7;
+  border-bottom: 0;
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
+  background: #ececec;
+  color: #2f2f35;
+  padding: 10px 16px;
+  font-family: "Arista Pro", sans-serif;
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.event-tab-btn.active {
+  background: #fff;
+  position: relative;
+}
+
+.event-tab-btn.active::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: -1px;
+  height: 2px;
+  background: #ffd039;
+}
+
+.event-description-block,
+.event-nearby-block {
+  background: #fff;
+  border: 1px solid #ececec;
+  border-radius: 16px;
+  padding: 16px;
+}
+
+.event-description-block h2,
+.event-nearby-block h2 {
+  margin: 0 0 10px;
+}
+
+.nearby-title {
+  margin: 0;
+  font-family: "Airfool", sans-serif;
+  font-size: clamp(52px, 6vw, 88px);
+  font-weight: 400;
+  line-height: 0.95;
+  color: #ff7264;
+}
+
+.empty-nearby {
+  min-height: 80px;
+}
+
+.reviews-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 1.2fr;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.reviews-summary {
+  background: #fafafa;
+  border: 1px solid #ececec;
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.reviews-average {
+  font-size: 42px;
+  line-height: 1;
+  font-weight: 500;
+}
+
+.reviews-count {
+  margin-top: 6px;
+  color: #676774;
+  font-size: 14px;
+}
+
+.reviews-bars {
+  display: grid;
+  gap: 6px;
+}
+
+.reviews-bar-row {
+  display: grid;
+  grid-template-columns: 76px 1fr 24px;
+  gap: 8px;
+  align-items: center;
+}
+
+.stars-label {
+  font-size: 14px;
+  color: #f3b21d;
+  letter-spacing: 1px;
+}
+
+.bar-track {
+  height: 6px;
+  background: #ececec;
+  border-radius: 999px;
+}
+
+.bar-fill {
+  height: 100%;
+  background: #f3b21d;
+  border-radius: 999px;
+}
+
+.bar-count {
+  text-align: right;
+  color: #666;
+  font-size: 13px;
+}
+
+.reviews-empty {
+  border: 1px dashed #ddd;
+  border-radius: 12px;
+  color: #666;
+  padding: 18px;
+}
+
+.reviews-list {
+  display: grid;
+  gap: 10px;
+}
+
+.review-card {
+  border: 1px solid #ececec;
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.review-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.review-author {
+  font-size: 20px;
+  font-weight: 500;
+}
+
+.review-date {
+  font-size: 14px;
+  color: #666;
+}
+
+.review-rating {
+  margin-top: 4px;
+  color: #f3b21d;
+  letter-spacing: 1px;
+}
+
+.review-text {
+  margin: 8px 0 0;
+  color: #333;
+  line-height: 1.35;
 }
 
 .auth-screen {
@@ -2048,6 +3188,144 @@ onUnmounted(() => {
   padding: 8px 10px;
   font-size: 16px;
   font-family: "Arista Pro", sans-serif;
+}
+
+.payment-form {
+  display: grid;
+  gap: 10px;
+}
+
+.payment-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 16px;
+}
+
+.payment-form input {
+  border: 1px solid #ddd;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 16px;
+  font-family: "Arista Pro", sans-serif;
+}
+
+.payment-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.payment-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.cvv-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cvv-wrap .link-btn {
+  text-decoration: none;
+  color: #2aa9ee;
+}
+
+.payment-cards {
+  margin-top: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.payment-card {
+  border: 1px solid #ececec;
+  border-radius: 14px;
+  background: #f8f8f8;
+  padding: 16px;
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: center;
+}
+
+.payment-card-main h3 {
+  margin: 0 0 8px;
+  font-size: 32px;
+  font-weight: 500;
+}
+
+.payment-card-main p {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: 1px;
+}
+
+.payment-card-actions {
+  display: grid;
+  gap: 8px;
+  justify-items: end;
+}
+
+.danger-link {
+  color: #2aa9ee;
+}
+
+.privacy-options {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.privacy-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 18px;
+}
+
+.privacy-option input {
+  width: 18px;
+  height: 18px;
+}
+
+.booking-list {
+  display: grid;
+  gap: 10px;
+}
+
+.booking-card {
+  border: 1px solid #e8e8e8;
+  border-radius: 12px;
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.booking-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  font-size: 18px;
+}
+
+.booking-item-row {
+  border-top: 1px solid #f0f0f0;
+  padding-top: 8px;
+  display: grid;
+  gap: 3px;
+}
+
+.booking-item-title {
+  font-size: 18px;
+  font-weight: 500;
+}
+
+.booking-muted {
+  color: #666;
+  font-size: 14px;
 }
 
 .long-text {
@@ -2356,7 +3634,7 @@ onUnmounted(() => {
   border: 1px solid #ddd;
 }
 
-.event-title {
+.event-card-title {
   font-size: 18px;
   font-weight: 500;
 }
@@ -2477,6 +3755,14 @@ onUnmounted(() => {
   .event-detail-grid {
     grid-template-columns: 1fr;
   }
+
+  .event-top-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .reviews-head {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 760px) {
@@ -2503,4 +3789,8 @@ onUnmounted(() => {
   }
 }
 </style>
+
+
+
+
 

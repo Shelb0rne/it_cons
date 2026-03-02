@@ -593,11 +593,33 @@ class UserPaymentMethod(models.Model):
         db_column="user_id",
         related_name="payment_methods",
     )
-    provider_method_id = models.CharField(max_length=255)
+    provider_method_id = models.CharField(max_length=255, null=True, blank=True)
+    card_number = models.CharField(max_length=12, null=True, blank=True)
     card_last4 = models.CharField(max_length=4, null=True, blank=True)
     card_brand = models.CharField(max_length=64, null=True, blank=True)
+    holder_name = models.CharField(max_length=255, null=True, blank=True)
+    expires_at = models.CharField(max_length=5, null=True, blank=True)
+    cvv_code = models.CharField(max_length=4, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
 
     class Meta:
         db_table = "user_payment_method"
+
+
+class UserPrivacySettings(models.Model):
+    privacy_id = models.BigAutoField(primary_key=True)
+    user = models.OneToOneField(
+        UserAccount,
+        on_delete=models.CASCADE,
+        db_column="user_id",
+        related_name="privacy_settings",
+    )
+    show_profile_in_reviews = models.BooleanField(default=False)
+    allow_email_notifications = models.BooleanField(default=True)
+    allow_sms_notifications = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "user_privacy_settings"
