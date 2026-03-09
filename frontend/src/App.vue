@@ -32,6 +32,11 @@ const createUserForm = ref({
 const createUserLoading = ref(false);
 const createUserError = ref("");
 const createUserSuccess = ref("");
+const adminRefundsLoading = ref(false);
+const adminRefundsError = ref("");
+const adminRefundsSuccess = ref("");
+const adminRefunds = ref([]);
+const adminRefundRejectComment = ref({});
 const organizerCompany = ref({
   display_name: "",
   phone: "",
@@ -139,6 +144,15 @@ const userBookingsLoading = ref(false);
 const userBookingsError = ref("");
 const userCurrentBookings = ref([]);
 const userHistoryBookings = ref([]);
+const userFavoritesLoading = ref(false);
+const userFavoritesError = ref("");
+const userFavorites = ref([]);
+const favoriteEventIds = ref([]);
+const ticketReceiptBooking = ref(null);
+const userRefundLoading = ref(false);
+const userRefundError = ref("");
+const userRefundSuccess = ref("");
+const refundConfirmBooking = ref(null);
 const userPaymentsLoading = ref(false);
 const userPaymentsError = ref("");
 const userPaymentsSuccess = ref("");
@@ -172,6 +186,28 @@ function persistAuth(value) {
   }
 }
 
+function setPendingAuthRedirect(path) {
+  if (!path) return;
+  localStorage.setItem("it_cons_next_path", path);
+}
+
+function popPendingAuthRedirect() {
+  const path = localStorage.getItem("it_cons_next_path");
+  if (path) localStorage.removeItem("it_cons_next_path");
+  return path;
+}
+
+function setPendingUserCabinetTab(tab) {
+  if (!tab) return;
+  localStorage.setItem("it_cons_user_tab", tab);
+}
+
+function popPendingUserCabinetTab() {
+  const tab = localStorage.getItem("it_cons_user_tab");
+  if (tab) localStorage.removeItem("it_cons_user_tab");
+  return tab;
+}
+
 function navigate(path) {
   if (currentPath.value === path) return;
   history.pushState({}, "", path);
@@ -182,6 +218,8 @@ function navigate(path) {
 function logout() {
   persistAuth(null);
   profile.value = null;
+  userFavorites.value = [];
+  favoriteEventIds.value = [];
   navigate("/");
 }
 
@@ -191,6 +229,22 @@ function openCabinetFromHeader() {
   } else {
     navigate("/login");
   }
+}
+
+function openFavoritesFromHeader() {
+  if (!auth.value) {
+    setPendingAuthRedirect("/cabinet");
+    setPendingUserCabinetTab("favorites");
+    navigate("/login");
+    return;
+  }
+  if (auth.value.role !== "user") {
+    navigate("/cabinet");
+    return;
+  }
+  userCabinetTab.value = "favorites";
+  setPendingUserCabinetTab("favorites");
+  navigate("/cabinet");
 }
 
 async function submitLogin() {
@@ -215,7 +269,8 @@ async function submitLogin() {
       role: payload.user.role,
       login: payload.user.login,
     });
-    navigate("/cabinet");
+    const nextPath = popPendingAuthRedirect();
+    navigate(nextPath || "/cabinet");
   } catch (error) {
     loginError.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -249,7 +304,7 @@ async function loadProfile() {
       await loadOrganizerCompany();
       await loadOrganizerEvents();
     } else if (payload.role === "user") {
-      userCabinetTab.value = "profile";
+      userCabinetTab.value = popPendingUserCabinetTab() || "profile";
       userProfileEdit.value = false;
       await loadUserCabinetData();
     }
@@ -958,6 +1013,7 @@ async function loadUserCabinetData() {
   resetUserPaymentForm();
   await loadUserProfile();
   await loadUserBookings();
+  await loadUserFavorites();
   await loadUserPaymentMethods();
   await loadUserPrivacy();
 }
@@ -1010,6 +1066,42 @@ async function submitCreateUser() {
 function handleRoute() {
   if (currentPath.value === "/") {
     loadPublicEvents();
+    if (auth.value?.role === "user") {
+      loadUserFavorites();
+    } else {
+      userFavorites.value = [];
+      favoriteEventIds.value = [];
+    }
+    return;
+  }
+
+  const ticketEventId = getEventTicketsIdFromPath(currentPath.value);
+  if (ticketEventId) {
+    if (!auth.value) {
+      setPendingAuthRedirect(currentPath.value);
+      navigate("/login");
+      return;
+    }
+    if (auth.value.role !== "user") {
+      navigate("/cabinet");
+      return;
+    }
+    loadTicketSelection(ticketEventId);
+    return;
+  }
+
+  const paymentReservationId = getReservationPaymentIdFromPath(currentPath.value);
+  if (paymentReservationId) {
+    if (!auth.value) {
+      setPendingAuthRedirect(currentPath.value);
+      navigate("/login");
+      return;
+    }
+    if (auth.value.role !== "user") {
+      navigate("/cabinet");
+      return;
+    }
+    loadReservationPayment(paymentReservationId);
     return;
   }
 
@@ -1037,10 +1129,10 @@ function handleRoute() {
 
 const city = ref("Москва");
 const search = ref("");
-const selectedDateKey = ref("2026-03-11");
+const selectedDateKey = ref(null);
 const calendarTrack = ref(null);
 const stickyMonthRef = ref(null);
-const stickyMonthLabel = ref("Февраль");
+const stickyMonthLabel = ref("");
 const stickyMonthLeft = ref(0);
 const currentMonthIndex = ref(0);
 const calendarScrollLeft = ref(0);
@@ -1052,14 +1144,47 @@ const publicEventsError = ref("");
 const publicEventLoading = ref(false);
 const publicEventError = ref("");
 const publicEvent = ref(null);
+const ticketSelectionLoading = ref(false);
+const ticketSelectionError = ref("");
+const ticketSelectionData = ref(null);
+const selectedTicketSessionId = ref(null);
+const selectedTicketTypeId = ref(null);
+const selectedSeatIds = ref([]);
+const reservationLoading = ref(false);
+const reservationError = ref("");
+const reservationSuccess = ref("");
+const latestReservation = ref(null);
+const paymentPageLoading = ref(false);
+const paymentPageError = ref("");
+const paymentPageSuccess = ref("");
+const reservationPayment = ref(null);
+const selectedPaymentMethodId = ref(null);
+const paymentSubmitting = ref(false);
+const paymentCountdownSec = ref(0);
+let paymentTimerHandle = null;
 
 const filteredEvents = computed(() => {
   const q = search.value.trim().toLowerCase();
-  if (!q) return events.value;
-  return events.value.filter((e) =>
-    `${e.title} ${e.venue}`.toLowerCase().includes(q)
-  );
+  return events.value.filter((e) => {
+    const matchesSearch = !q || `${e.title} ${e.venue}`.toLowerCase().includes(q);
+    const matchesDate = !selectedDateKey.value || e.date_key === selectedDateKey.value;
+    return matchesSearch && matchesDate;
+  });
 });
+
+function dateKeyFromIso(isoDate) {
+  if (!isoDate) return null;
+  const dt = new Date(isoDate);
+  if (Number.isNaN(dt.getTime())) return null;
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const d = String(dt.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function toggleCalendarDate(key) {
+  selectedDateKey.value = selectedDateKey.value === key ? null : key;
+}
 
 function formatEventDateTime(isoDate) {
   if (!isoDate) return "Дата уточняется";
@@ -1080,6 +1205,165 @@ function formatEventDetailDate(isoDate) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function bookingStatusLabel(status) {
+  if (status === "paid") return "Оплачен";
+  if (status === "awaiting_payment") return "Ожидает оплату";
+  return status || "Неизвестно";
+}
+
+function refundStatusLabel(status) {
+  if (status === "requested") return "Запрошен";
+  if (status === "approved") return "Одобрен";
+  if (status === "processing") return "В обработке";
+  if (status === "succeeded") return "Выполнен";
+  if (status === "rejected") return "Отклонен";
+  return status || "—";
+}
+
+function formatDaysLeft(days) {
+  const n = Number(days);
+  if (!Number.isFinite(n)) return "дата уточняется";
+  if (n <= 0) return "сегодня";
+  if (n === 1) return "1 день";
+  if (n >= 2 && n <= 4) return `${n} дня`;
+  return `${n} дней`;
+}
+
+function openTicketReceipt(booking, event) {
+  if (event) event.stopPropagation();
+  userRefundError.value = "";
+  userRefundSuccess.value = "";
+  ticketReceiptBooking.value = booking || null;
+}
+
+function closeTicketReceipt() {
+  ticketReceiptBooking.value = null;
+  refundConfirmBooking.value = null;
+}
+
+function openRefundConfirm(booking) {
+  userRefundError.value = "";
+  userRefundSuccess.value = "";
+  refundConfirmBooking.value = booking || null;
+}
+
+function closeRefundConfirm() {
+  refundConfirmBooking.value = null;
+}
+
+async function requestRefundForBooking() {
+  const booking = refundConfirmBooking.value || ticketReceiptBooking.value;
+  const orderId = booking?.order_id;
+  if (!orderId || !auth.value?.token) return;
+  userRefundLoading.value = true;
+  userRefundError.value = "";
+  userRefundSuccess.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/user/orders/${orderId}/refund-request`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      userRefundError.value = payload.error || "Не удалось отправить заявку на возврат";
+      return;
+    }
+    userRefundSuccess.value = "Заявка на возврат отправлена администратору";
+    closeRefundConfirm();
+    await loadUserBookings();
+    if (ticketReceiptBooking.value?.order_id === orderId) {
+      const updated = userCurrentBookings.value.find((item) => item.order_id === orderId);
+      if (updated) ticketReceiptBooking.value = updated;
+    }
+  } catch (error) {
+    userRefundError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    userRefundLoading.value = false;
+  }
+}
+
+async function loadUserFavorites() {
+  if (!auth.value?.token || auth.value.role !== "user") {
+    userFavorites.value = [];
+    favoriteEventIds.value = [];
+    return;
+  }
+  userFavoritesLoading.value = true;
+  userFavoritesError.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/user/favorites`, {
+      headers: { Authorization: `Bearer ${auth.value.token}` },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      userFavoritesError.value = payload.error || "Не удалось загрузить избранное";
+      return;
+    }
+    userFavorites.value = payload.events || [];
+    favoriteEventIds.value = payload.event_ids || [];
+  } catch (error) {
+    userFavoritesError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    userFavoritesLoading.value = false;
+  }
+}
+
+function isFavoriteEvent(eventId) {
+  if (!auth.value || auth.value.role !== "user") return false;
+  return favoriteEventIds.value.includes(eventId);
+}
+
+async function toggleFavorite(eventId, event) {
+  if (event) event.stopPropagation();
+  if (!eventId) return;
+  if (!auth.value) {
+    setPendingAuthRedirect(currentPath.value || "/");
+    navigate("/login");
+    return;
+  }
+  if (auth.value.role !== "user") {
+    return;
+  }
+
+  const isFavorite = isFavoriteEvent(eventId);
+  try {
+    if (isFavorite) {
+      const response = await fetch(`${apiBase}/api/user/favorites/${eventId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${auth.value.token}` },
+      });
+      if (!response.ok) {
+        const payload = await response.json();
+        throw new Error(payload.error || "Не удалось удалить из избранного");
+      }
+      favoriteEventIds.value = favoriteEventIds.value.filter((id) => id !== eventId);
+      userFavorites.value = userFavorites.value.filter((item) => item.event_id !== eventId);
+      return;
+    }
+
+    const response = await fetch(`${apiBase}/api/user/favorites`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+      body: JSON.stringify({ event_id: eventId }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "Не удалось добавить в избранное");
+    }
+    if (!favoriteEventIds.value.includes(eventId)) {
+      favoriteEventIds.value = [...favoriteEventIds.value, eventId];
+    }
+    await loadUserFavorites();
+  } catch (error) {
+    publicEventsError.value = error instanceof Error ? error.message : String(error);
+  }
 }
 
 function eventPrimarySession(eventPayload) {
@@ -1200,6 +1484,7 @@ async function loadPublicEvents() {
       id: event.event_id,
       title: event.title,
       date: formatEventDateTime(event.starts_at),
+      date_key: dateKeyFromIso(event.starts_at),
       venue: event.venue_name || event.venue_address || "-",
       price: event.min_price,
       cover_image_url: event.cover_image_url,
@@ -1214,6 +1499,399 @@ async function loadPublicEvents() {
 function getEventIdFromPath(path) {
   const match = path.match(/^\/event\/(\d+)$/);
   return match ? Number(match[1]) : null;
+}
+
+function getEventTicketsIdFromPath(path) {
+  const match = path.match(/^\/event\/(\d+)\/tickets$/);
+  return match ? Number(match[1]) : null;
+}
+
+function getReservationPaymentIdFromPath(path) {
+  const match = path.match(/^\/reservations\/(\d+)\/pay$/);
+  return match ? Number(match[1]) : null;
+}
+
+const isTicketSelectionPath = computed(() => getEventTicketsIdFromPath(currentPath.value) !== null);
+const isReservationPaymentPath = computed(() => getReservationPaymentIdFromPath(currentPath.value) !== null);
+
+const ticketSessions = computed(() => ticketSelectionData.value?.sessions || []);
+
+const activeTicketSession = computed(() => {
+  if (!ticketSessions.value.length) return null;
+  return (
+    ticketSessions.value.find((s) => s.session_id === selectedTicketSessionId.value) ||
+    ticketSessions.value[0]
+  );
+});
+
+const activeTicketTypes = computed(() => activeTicketSession.value?.ticket_types || []);
+
+const selectedTicketType = computed(() => {
+  if (!activeTicketTypes.value.length) return null;
+  return (
+    activeTicketTypes.value.find((t) => t.ticket_type_id === selectedTicketTypeId.value) ||
+    activeTicketTypes.value[0]
+  );
+});
+
+const groupedSeats = computed(() => {
+  const source = ticketSelectionData.value?.seats || [];
+  const map = new Map();
+  source.forEach((seat) => {
+    const key = seat.row_number || "-";
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(seat);
+  });
+  return Array.from(map.entries())
+    .map(([row, seats]) => ({
+      row,
+      seats: seats.sort((a, b) => Number(a.seat_number) - Number(b.seat_number)),
+    }))
+    .sort((a, b) => Number(a.row) - Number(b.row));
+});
+
+const reservationTotal = computed(() => {
+  const unitPrice = Number(selectedTicketType.value?.price);
+  if (!Number.isFinite(unitPrice)) return null;
+  return unitPrice * selectedSeatIds.value.length;
+});
+
+const serviceFeePerSeat = 80;
+
+const seatsById = computed(() => {
+  const map = new Map();
+  (ticketSelectionData.value?.seats || []).forEach((seat) => {
+    map.set(seat.seat_id, seat);
+  });
+  return map;
+});
+
+const selectedSeatItems = computed(() =>
+  selectedSeatIds.value
+    .map((seatId) => {
+      const seat = seatsById.value.get(seatId);
+      if (!seat) return null;
+      return {
+        seat_id: seatId,
+        row_number: seat.row_number,
+        seat_number: seat.seat_number,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (a.row_number !== b.row_number) return Number(a.row_number) - Number(b.row_number);
+      return Number(a.seat_number) - Number(b.seat_number);
+    })
+);
+
+const reservationServiceFee = computed(() =>
+  selectedSeatIds.value.length ? selectedSeatIds.value.length * serviceFeePerSeat : 0
+);
+
+const reservationGrandTotal = computed(() => {
+  if (reservationTotal.value == null) return null;
+  return reservationTotal.value + reservationServiceFee.value;
+});
+
+const activeUserPaymentMethods = computed(() =>
+  (userPaymentMethods.value || []).filter((method) => method.status === "active")
+);
+
+const paymentTotalAmount = computed(() => {
+  const base = Number(reservationPayment.value?.total_amount);
+  if (!Number.isFinite(base)) return null;
+  return base + serviceFeePerSeat * Number(reservationPayment.value?.qty || 0);
+});
+
+const selectedPaymentMethod = computed(() =>
+  activeUserPaymentMethods.value.find((item) => item.payment_method_id === selectedPaymentMethodId.value) || null
+);
+
+function isSeatSelected(seatId) {
+  return selectedSeatIds.value.includes(seatId);
+}
+
+function toggleSeatSelection(seat) {
+  if (!seat?.is_available) return;
+  const idx = selectedSeatIds.value.indexOf(seat.seat_id);
+  if (idx >= 0) {
+    selectedSeatIds.value.splice(idx, 1);
+    return;
+  }
+  selectedSeatIds.value.push(seat.seat_id);
+}
+
+function clearSeatSelection() {
+  selectedSeatIds.value = [];
+}
+
+function stopPaymentTimer() {
+  if (paymentTimerHandle) {
+    clearInterval(paymentTimerHandle);
+    paymentTimerHandle = null;
+  }
+}
+
+async function loadAdminRefunds() {
+  if (!auth.value?.token) return;
+  adminRefundsLoading.value = true;
+  adminRefundsError.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/admin/refunds?status=requested`, {
+      headers: {
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      adminRefundsError.value = payload.error || "Не удалось загрузить заявки на возврат";
+      return;
+    }
+    adminRefunds.value = payload.items || [];
+  } catch (error) {
+    adminRefundsError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    adminRefundsLoading.value = false;
+  }
+}
+
+async function adminReviewRefund(refundId, action) {
+  if (!auth.value?.token) return;
+  adminRefundsSuccess.value = "";
+  adminRefundsError.value = "";
+  const comment = (adminRefundRejectComment.value[refundId] || "").trim();
+  if (action === "reject" && !comment) {
+    adminRefundsError.value = "Укажите причину отклонения";
+    return;
+  }
+  try {
+    const response = await fetch(`${apiBase}/api/admin/refunds/${refundId}/review`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+      body: JSON.stringify({
+        action,
+        admin_comment: comment,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      adminRefundsError.value = payload.error || "Не удалось обработать заявку";
+      return;
+    }
+    adminRefundsSuccess.value = action === "approve" ? "Возврат одобрен" : "Возврат отклонен";
+    delete adminRefundRejectComment.value[refundId];
+    await loadAdminRefunds();
+  } catch (error) {
+    adminRefundsError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+function startPaymentTimer(expiresAtIso) {
+  stopPaymentTimer();
+  const update = () => {
+    const expiresTs = Date.parse(expiresAtIso || "");
+    if (!Number.isFinite(expiresTs)) {
+      paymentCountdownSec.value = 0;
+      stopPaymentTimer();
+      return;
+    }
+    const left = Math.max(0, Math.floor((expiresTs - Date.now()) / 1000));
+    paymentCountdownSec.value = left;
+    if (left <= 0) {
+      stopPaymentTimer();
+      paymentPageError.value = "Время оплаты истекло. Бронирование отменено.";
+      reservationPayment.value = null;
+    }
+  };
+  update();
+  paymentTimerHandle = setInterval(update, 1000);
+}
+
+function formatCountdown(totalSec) {
+  const sec = Math.max(0, Number(totalSec) || 0);
+  const mm = String(Math.floor(sec / 60)).padStart(2, "0");
+  const ss = String(sec % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
+}
+
+function openTicketSelection(eventId) {
+  if (!eventId) return;
+  if (!auth.value?.token) {
+    const path = `/event/${eventId}/tickets`;
+    setPendingAuthRedirect(path);
+    navigate("/login");
+    return;
+  }
+  if (auth.value.role !== "user") {
+    navigate("/cabinet");
+    return;
+  }
+  navigate(`/event/${eventId}/tickets`);
+}
+
+async function loadTicketSelection(eventId) {
+  if (!eventId) return;
+  ticketSelectionLoading.value = true;
+  ticketSelectionError.value = "";
+  reservationError.value = "";
+  reservationSuccess.value = "";
+  selectedSeatIds.value = [];
+  try {
+    const { response, payload } = await fetchJsonWithRetry(`${apiBase}/api/events/${eventId}/seat-map`);
+    if (!response.ok) {
+      ticketSelectionError.value = payload.error || "Не удалось загрузить схему мест";
+      return;
+    }
+    ticketSelectionData.value = payload;
+    selectedTicketSessionId.value = payload.active_session_id || payload.sessions?.[0]?.session_id || null;
+    selectedTicketTypeId.value =
+      payload.sessions?.find((x) => x.session_id === selectedTicketSessionId.value)?.ticket_types?.[0]
+        ?.ticket_type_id ||
+      payload.sessions?.[0]?.ticket_types?.[0]?.ticket_type_id ||
+      null;
+  } catch (error) {
+    ticketSelectionError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    ticketSelectionLoading.value = false;
+  }
+}
+
+async function loadReservationPayment(reservationId) {
+  if (!reservationId || !auth.value?.token) return;
+  paymentPageLoading.value = true;
+  paymentPageError.value = "";
+  paymentPageSuccess.value = "";
+  reservationPayment.value = null;
+  selectedPaymentMethodId.value = null;
+  stopPaymentTimer();
+  try {
+    await loadUserPaymentMethods();
+    const response = await fetch(`${apiBase}/api/user/reservations/${reservationId}`, {
+      headers: {
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      paymentPageError.value = payload.error || "Не удалось загрузить данные бронирования";
+      return;
+    }
+    reservationPayment.value = payload;
+    selectedPaymentMethodId.value = activeUserPaymentMethods.value[0]?.payment_method_id || null;
+    startPaymentTimer(payload.expires_at);
+  } catch (error) {
+    paymentPageError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    paymentPageLoading.value = false;
+  }
+}
+
+watch(selectedTicketSessionId, (sessionId) => {
+  const session = ticketSessions.value.find((x) => x.session_id === sessionId);
+  selectedTicketTypeId.value = session?.ticket_types?.[0]?.ticket_type_id || null;
+  selectedSeatIds.value = [];
+});
+
+async function submitReservation() {
+  if (!auth.value?.token) {
+    setPendingAuthRedirect(currentPath.value);
+    navigate("/login");
+    return;
+  }
+  if (!ticketSelectionData.value?.event_id || !selectedTicketSessionId.value || !selectedTicketTypeId.value) {
+    reservationError.value = "Недостаточно данных для бронирования";
+    return;
+  }
+  if (!selectedSeatIds.value.length) {
+    reservationError.value = "Выберите хотя бы одно место";
+    return;
+  }
+
+  reservationLoading.value = true;
+  reservationError.value = "";
+  reservationSuccess.value = "";
+  latestReservation.value = null;
+  try {
+    const response = await fetch(`${apiBase}/api/user/reservations`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+      body: JSON.stringify({
+        event_id: ticketSelectionData.value.event_id,
+        session_id: selectedTicketSessionId.value,
+        ticket_type_id: selectedTicketTypeId.value,
+        seat_ids: selectedSeatIds.value,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      reservationError.value = payload.error || "Не удалось создать бронирование";
+      if (payload.unavailable_seat_ids?.length) {
+        selectedSeatIds.value = selectedSeatIds.value.filter((sid) => !payload.unavailable_seat_ids.includes(sid));
+      }
+      return;
+    }
+    reservationSuccess.value = `Бронирование #${payload.reservation_id} создано до ${formatCabinetDate(payload.expires_at)}`;
+    latestReservation.value = payload;
+    await loadTicketSelection(ticketSelectionData.value.event_id);
+  } catch (error) {
+    reservationError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    reservationLoading.value = false;
+  }
+}
+
+function goToPayment() {
+  const reservationId = latestReservation.value?.reservation_id;
+  if (!reservationId) return;
+  navigate(`/reservations/${reservationId}/pay`);
+}
+
+async function submitReservationPayment() {
+  if (!auth.value?.token) {
+    setPendingAuthRedirect(currentPath.value);
+    navigate("/login");
+    return;
+  }
+  const reservationId = reservationPayment.value?.reservation_id || getReservationPaymentIdFromPath(currentPath.value);
+  if (!reservationId) {
+    paymentPageError.value = "Бронирование не найдено";
+    return;
+  }
+  paymentSubmitting.value = true;
+  paymentPageError.value = "";
+  paymentPageSuccess.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/user/reservations/${reservationId}/pay`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+      body: JSON.stringify({
+        payment_method_id: selectedPaymentMethodId.value || null,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      paymentPageError.value = payload.error || "Не удалось выполнить оплату";
+      return;
+    }
+    paymentPageSuccess.value = `Оплата прошла успешно. Заказ #${payload.order_id}`;
+    stopPaymentTimer();
+    latestReservation.value = null;
+    reservationPayment.value = null;
+    setTimeout(() => navigate("/cabinet"), 700);
+  } catch (error) {
+    paymentPageError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    paymentSubmitting.value = false;
+  }
 }
 
 async function loadPublicEventDetail(eventId) {
@@ -1273,7 +1951,12 @@ function buildCalendarDays(startDate, endDate) {
   return days;
 }
 
-const calendarDays = buildCalendarDays(new Date(2026, 1, 20), new Date(2026, 11, 31));
+const calendarStart = new Date();
+calendarStart.setHours(0, 0, 0, 0);
+const calendarEnd = new Date(calendarStart);
+calendarEnd.setDate(calendarEnd.getDate() + 365);
+const calendarDays = buildCalendarDays(calendarStart, calendarEnd);
+stickyMonthLabel.value = calendarDays[0]?.monthLabel || monthNames[new Date().getMonth()];
 
 const monthStarts = computed(() => {
   const starts = [];
@@ -1397,12 +2080,34 @@ onMounted(async () => {
 });
 
 watch(currentPath, async () => {
+  if (!isReservationPaymentPath.value) {
+    stopPaymentTimer();
+  }
   await attachCalendarListenersIfNeeded();
 });
+
+watch(adminTab, async (tab) => {
+  if (tab === "refunds" && auth.value?.role === "admin") {
+    await loadAdminRefunds();
+  }
+});
+
+watch(
+  () => auth.value?.role,
+  async (role) => {
+    if (role === "user") {
+      await loadUserFavorites();
+      return;
+    }
+    userFavorites.value = [];
+    favoriteEventIds.value = [];
+  }
+);
 
 onUnmounted(() => {
   if (onPopState) window.removeEventListener("popstate", onPopState);
   detachCalendarListeners();
+  stopPaymentTimer();
 });
 </script>
 
@@ -1428,7 +2133,7 @@ onUnmounted(() => {
               <circle cx="12" cy="9" r="2.5" />
             </svg>
           </button>
-          <button class="icon-btn" title="Избранное" aria-label="Избранное">
+          <button class="icon-btn" title="Избранное" aria-label="Избранное" @click="openFavoritesFromHeader">
             <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
               <path
                 d="M12 20.5 4.8 13.8A4.9 4.9 0 0 1 12 7.6a4.9 4.9 0 0 1 7.2 6.2L12 20.5z"
@@ -1487,7 +2192,7 @@ onUnmounted(() => {
                   :key="d.key"
                   class="day-cell"
                   :class="{ weekend: d.weekend, selected: selectedDateKey === d.key }"
-                  @click="selectedDateKey = d.key"
+                  @click="toggleCalendarDate(d.key)"
                 >
                   <span class="num">{{ d.day }}</span>
                   <span class="dow">{{ d.dow }}</span>
@@ -1516,6 +2221,16 @@ onUnmounted(() => {
             class="card main-event-card clickable"
             @click="navigate(`/event/${event.id}`)"
           >
+            <button
+              class="favorite-heart"
+              :class="{ active: isFavoriteEvent(event.id) }"
+              @click="toggleFavorite(event.id, $event)"
+              aria-label="Избранное"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 20.5 4.8 13.8A4.9 4.9 0 0 1 12 7.6a4.9 4.9 0 0 1 7.2 6.2L12 20.5z" />
+              </svg>
+            </button>
             <img
               v-if="event.cover_image_url"
               class="poster"
@@ -1535,7 +2250,7 @@ onUnmounted(() => {
       </section>
     </main>
 
-    <main v-else-if="currentPath.startsWith('/event/')" class="screen event-screen">
+    <main v-else-if="currentPath.startsWith('/event/') && !isTicketSelectionPath" class="screen event-screen">
       <header class="header">
         <div class="logo-wrap" @click="navigate('/')" style="cursor: pointer;">
           <span class="logo-star" aria-hidden="true"></span>
@@ -1589,7 +2304,9 @@ onUnmounted(() => {
               <b>Дата:</b>
               {{ activePublicSession ? formatEventDetailDate(activePublicSession.starts_at) : "Дата уточняется" }}
             </div>
-            <button class="yellow-btn tickets-btn">Выбрать билеты</button>
+            <button class="yellow-btn tickets-btn" @click="openTicketSelection(publicEvent.event_id)">
+              Выбрать билеты
+            </button>
           </aside>
         </div>
 
@@ -1662,6 +2379,239 @@ onUnmounted(() => {
           <h2 class="nearby-title">Места рядом</h2>
           <div class="empty-nearby"></div>
         </section>
+      </section>
+    </main>
+
+    <main v-else-if="isTicketSelectionPath" class="screen ticket-screen">
+      <div class="ticket-breadcrumb">
+        <button class="crumb-link" @click="navigate(`/event/${ticketSelectionData?.event_id || getEventTicketsIdFromPath(currentPath)}`)">
+          ← Выбор мест - Бронирование
+        </button>
+      </div>
+
+      <p v-if="ticketSelectionLoading">Загрузка схемы мест...</p>
+      <p v-else-if="ticketSelectionError" class="error">{{ ticketSelectionError }}</p>
+
+      <section v-else-if="ticketSelectionData" class="ticket-layout">
+        <div class="ticket-left">
+          <div class="ticket-left-head">
+            <h2 class="ticket-map-title">Выбор мест</h2>
+            <div class="ticket-timer">15:00</div>
+          </div>
+
+          <div class="hall-stage">СЦЕНА</div>
+          <div class="seat-map">
+            <div v-for="row in groupedSeats" :key="`row-${row.row}`" class="seat-row">
+              <div class="row-label">{{ row.row }}</div>
+              <div class="row-seats">
+                <button
+                  v-for="seat in row.seats"
+                  :key="seat.seat_id"
+                  class="seat-btn"
+                  :class="{
+                    selected: isSeatSelected(seat.seat_id),
+                    unavailable: !seat.is_available,
+                  }"
+                  :disabled="!seat.is_available"
+                  @click="toggleSeatSelection(seat)"
+                >
+                  {{ seat.seat_number }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="seat-legend">
+            <span class="legend-chip selected">Выбрано</span>
+            <span class="legend-chip available">Доступно</span>
+            <span class="legend-chip unavailable">Занято</span>
+          </div>
+
+          <button class="soft clear-seat-btn" @click="clearSeatSelection">Очистить выбор</button>
+        </div>
+
+        <aside class="ticket-right">
+          <div class="ticket-event-card">
+            <img
+              v-if="ticketSelectionData.cover_image_url"
+              class="ticket-event-cover"
+              :src="ticketSelectionData.cover_image_url"
+              :alt="ticketSelectionData.title"
+            />
+            <div v-else class="ticket-event-cover ticket-event-cover-fallback"></div>
+
+            <div class="ticket-event-main">
+              <h3>{{ ticketSelectionData.title }}</h3>
+              <div class="ticket-event-meta">
+                {{ activeTicketSession ? formatEventDetailDate(activeTicketSession.starts_at) : "Дата уточняется" }}
+              </div>
+              <div class="ticket-event-meta">{{ ticketSelectionData.venue_name }}, {{ ticketSelectionData.venue_address }}</div>
+            </div>
+          </div>
+
+          <div class="ticket-controls">
+            <label>
+              Сеанс
+              <select v-model.number="selectedTicketSessionId">
+                <option v-for="session in ticketSessions" :key="session.session_id" :value="session.session_id">
+                  {{ formatEventDetailDate(session.starts_at) }}
+                </option>
+              </select>
+            </label>
+            <label>
+              Тип билета
+              <select v-model.number="selectedTicketTypeId">
+                <option
+                  v-for="ticketType in activeTicketTypes"
+                  :key="ticketType.ticket_type_id"
+                  :value="ticketType.ticket_type_id"
+                >
+                  {{ ticketType.name }} · {{ ticketType.price }} {{ ticketType.currency }}
+                </option>
+              </select>
+            </label>
+          </div>
+
+          <h2 class="ticket-order-title">Выбранные места</h2>
+          <div v-if="selectedSeatItems.length" class="ticket-order-seats">
+            <div v-for="seat in selectedSeatItems" :key="seat.seat_id" class="ticket-order-seat-row">
+              <span>Ряд {{ seat.row_number }}, место {{ seat.seat_number }}</span>
+              <span>{{ selectedTicketType ? `${selectedTicketType.price} ₽` : "—" }}</span>
+            </div>
+          </div>
+          <div v-else class="ticket-order-empty">Пока не выбрано ни одного места</div>
+
+          <div class="ticket-order-totals">
+            <div class="ticket-order-line">
+              <span>Цена билетов x{{ selectedSeatIds.length }}</span>
+              <span>{{ reservationTotal == null ? "—" : `${reservationTotal} ₽` }}</span>
+            </div>
+            <div class="ticket-order-line">
+              <span>Работа сервиса</span>
+              <span>{{ reservationServiceFee }} ₽</span>
+            </div>
+            <div class="ticket-order-line total">
+              <span>Итого</span>
+              <span>{{ reservationGrandTotal == null ? "—" : `${reservationGrandTotal} ₽` }}</span>
+            </div>
+          </div>
+
+          <button class="yellow-btn tickets-btn ticket-confirm-btn" :disabled="reservationLoading" @click="submitReservation">
+            {{ reservationLoading ? "Бронируем..." : "Подтвердить бронирование" }}
+          </button>
+          <p v-if="reservationError" class="error">{{ reservationError }}</p>
+          <p v-if="reservationSuccess" class="success">{{ reservationSuccess }}</p>
+          <button
+            v-if="latestReservation?.reservation_id"
+            class="yellow-btn tickets-btn pay-btn"
+            @click="goToPayment"
+          >
+            Оплатить
+          </button>
+        </aside>
+      </section>
+    </main>
+
+    <main v-else-if="isReservationPaymentPath" class="screen payment-screen">
+      <div class="ticket-breadcrumb">
+        <button
+          class="crumb-link"
+          @click="navigate(reservationPayment?.event_id ? `/event/${reservationPayment.event_id}/tickets` : '/')"
+        >
+          ← Бронирование - Оплата
+        </button>
+      </div>
+
+      <h1 class="payment-title">Оплата заказа</h1>
+      <p class="payment-subtitle">Безопасная оплата</p>
+
+      <p v-if="paymentPageLoading">Загрузка данных оплаты...</p>
+      <p v-else-if="paymentPageError" class="error">{{ paymentPageError }}</p>
+
+      <section v-else-if="reservationPayment" class="payment-layout">
+        <section class="payment-left">
+          <h2>Способ оплаты</h2>
+          <div class="payment-methods-row">
+            <button
+              v-for="method in activeUserPaymentMethods"
+              :key="method.payment_method_id"
+              class="soft payment-method-btn"
+              :class="{ active: selectedPaymentMethodId === method.payment_method_id }"
+              @click="selectedPaymentMethodId = method.payment_method_id"
+            >
+              {{ method.card_brand || "Банковская карта" }} •••• {{ method.card_last4 || "0000" }}
+            </button>
+            <button class="soft payment-method-btn" @click="navigate('/cabinet')">Добавить карту</button>
+          </div>
+
+          <div class="payment-card-preview">
+            <div class="payment-field">
+              <span>Номер карты</span>
+              <strong>{{ selectedPaymentMethod?.card_last4 ? `•••• •••• •••• ${selectedPaymentMethod.card_last4}` : "Не выбрано" }}</strong>
+            </div>
+            <div class="payment-field">
+              <span>Срок действия</span>
+              <strong>{{ selectedPaymentMethod?.expires_at || "--/--" }}</strong>
+            </div>
+            <div class="payment-field">
+              <span>Владелец</span>
+              <strong>{{ selectedPaymentMethod?.holder_name || (profile?.full_name || "Пользователь") }}</strong>
+            </div>
+          </div>
+
+          <button
+            class="yellow-btn payment-submit-btn"
+            :disabled="paymentSubmitting || !selectedPaymentMethodId"
+            @click="submitReservationPayment"
+          >
+            {{ paymentSubmitting ? "Оплачиваем..." : "Оплатить" }}
+          </button>
+          <p v-if="paymentPageSuccess" class="success">{{ paymentPageSuccess }}</p>
+        </section>
+
+        <aside class="payment-right">
+          <div class="payment-timer">
+            Оплатить до: <b>{{ formatCountdown(paymentCountdownSec) }}</b>
+          </div>
+
+          <div class="ticket-event-card">
+            <img
+              v-if="reservationPayment.cover_image_url"
+              class="ticket-event-cover"
+              :src="reservationPayment.cover_image_url"
+              :alt="reservationPayment.title"
+            />
+            <div v-else class="ticket-event-cover ticket-event-cover-fallback"></div>
+            <div class="ticket-event-main">
+              <h3>{{ reservationPayment.title }}</h3>
+              <div class="ticket-event-meta">{{ formatEventDetailDate(reservationPayment.starts_at) }}</div>
+              <div class="ticket-event-meta">{{ reservationPayment.venue_city }}, {{ reservationPayment.venue_address }}</div>
+            </div>
+          </div>
+
+          <h3 class="ticket-order-title">Бронирование #{{ reservationPayment.reservation_id }}</h3>
+          <div class="ticket-order-seats">
+            <div v-for="seat in reservationPayment.selected_seats" :key="seat.seat_id" class="ticket-order-seat-row">
+              <span>Ряд {{ seat.row_number }}, место {{ seat.seat_number }}</span>
+              <span>{{ reservationPayment.unit_price }} ₽</span>
+            </div>
+          </div>
+
+          <div class="ticket-order-totals">
+            <div class="ticket-order-line">
+              <span>Цена билетов x{{ reservationPayment.qty }}</span>
+              <span>{{ reservationPayment.total_amount }} ₽</span>
+            </div>
+            <div class="ticket-order-line">
+              <span>Работа сервиса</span>
+              <span>{{ serviceFeePerSeat * reservationPayment.qty }} ₽</span>
+            </div>
+            <div class="ticket-order-line total">
+              <span>Итоговая стоимость</span>
+              <span>{{ paymentTotalAmount == null ? "—" : `${paymentTotalAmount} ₽` }}</span>
+            </div>
+          </div>
+        </aside>
       </section>
     </main>
 
@@ -2067,6 +3017,13 @@ onUnmounted(() => {
             </button>
             <button
               class="cabinet-menu-item"
+              :class="{ active: userCabinetTab === 'favorites' }"
+              @click="userCabinetTab = 'favorites'"
+            >
+              Избранное
+            </button>
+            <button
+              class="cabinet-menu-item"
               :class="{ active: userCabinetTab === 'payments' }"
               @click="userCabinetTab = 'payments'"
             >
@@ -2115,18 +3072,103 @@ onUnmounted(() => {
               </div>
               <div class="row-line"></div>
               <p v-if="!userCurrentBookings.length">Пока нет текущих бронирований</p>
-              <div v-else class="booking-list">
-                <article v-for="booking in userCurrentBookings" :key="`res-${booking.reservation_id}`" class="booking-card">
-                  <div class="booking-head">
-                    <div>Бронирование #{{ booking.reservation_id }}</div>
-                    <div class="booking-muted">До {{ formatCabinetDate(booking.expires_at) }}</div>
+              <div v-else class="user-booking-cards">
+                <article
+                  v-for="booking in userCurrentBookings"
+                  :key="`cur-${booking.order_id || booking.reservation_id}`"
+                  class="card main-event-card clickable user-booking-card"
+                  @click="booking.event_id && navigate(`/event/${booking.event_id}`)"
+                >
+                  <img
+                    v-if="booking.cover_image_url"
+                    class="poster"
+                    :src="booking.cover_image_url"
+                    :alt="booking.event_title || 'Событие'"
+                  />
+                  <div v-else class="poster poster-1"></div>
+                  <h2>{{ booking.event_title || "Событие" }}</h2>
+                  <p>
+                    {{ formatEventDateTime(booking.starts_at) }}<br />
+                    {{ booking.venue_name || "-" }}
+                  </p>
+                  <div class="booking-meta-grid">
+                    <div class="booking-muted">Статус: {{ bookingStatusLabel(booking.status) }}</div>
+                    <div class="booking-muted">Билетов: {{ booking.ticket_qty || 0 }}</div>
+                    <div class="booking-muted">Сумма: {{ booking.total_amount || 0 }} {{ booking.currency || "RUB" }}</div>
+                    <div class="booking-muted">До события: {{ formatDaysLeft(booking.days_left) }}</div>
+                    <div v-if="booking.refund?.status" class="booking-muted">
+                      Возврат: {{ refundStatusLabel(booking.refund.status) }}
+                    </div>
+                    <div v-if="booking.refund?.status === 'rejected' && booking.refund?.admin_comment" class="booking-muted">
+                      Причина: {{ booking.refund.admin_comment }}
+                    </div>
                   </div>
-                  <div v-for="(item, idx) in booking.items" :key="`res-${booking.reservation_id}-${idx}`" class="booking-item-row">
-                    <div class="booking-item-title">{{ item.event_title || "Событие" }}</div>
-                    <div class="booking-muted">{{ formatCabinetDate(item.starts_at) }} В· {{ item.venue_name || "-" }}</div>
-                    <div class="booking-muted">{{ item.ticket_type || "Билет" }}</div>
-                  </div>
+                  <button class="yellow-btn booking-ticket-btn" @click="openTicketReceipt(booking, $event)">Билет</button>
                 </article>
+              </div>
+
+              <div v-if="ticketReceiptBooking" class="receipt-overlay" @click="closeTicketReceipt">
+                <div class="receipt-modal" @click.stop>
+                  <button class="receipt-close" @click="closeTicketReceipt">×</button>
+                  <h3>Кассовый чек</h3>
+                  <div class="receipt-line"><span>Заказ:</span><b>#{{ ticketReceiptBooking.order_id }}</b></div>
+                  <div class="receipt-line"><span>Событие:</span><b>{{ ticketReceiptBooking.event_title }}</b></div>
+                  <div class="receipt-line"><span>Дата сеанса:</span><b>{{ formatEventDateTime(ticketReceiptBooking.starts_at) }}</b></div>
+                  <div class="receipt-line"><span>Площадка:</span><b>{{ ticketReceiptBooking.venue_name || "-" }}</b></div>
+                  <div class="receipt-line"><span>Статус:</span><b>{{ bookingStatusLabel(ticketReceiptBooking.status) }}</b></div>
+                  <div class="receipt-divider"></div>
+                  <div
+                    v-for="(ticket, idx) in (ticketReceiptBooking.tickets || [])"
+                    :key="`ticket-check-${idx}`"
+                    class="receipt-line"
+                  >
+                    <span>
+                      {{ ticket.ticket_type || "Билет" }}
+                      <template v-if="ticket.row_number && ticket.seat_number">
+                        · ряд {{ ticket.row_number }}, место {{ ticket.seat_number }}
+                      </template>
+                    </span>
+                    <b>{{ ticket.unit_price }} {{ ticket.currency }}</b>
+                  </div>
+                  <div class="receipt-divider"></div>
+                  <div class="receipt-line"><span>Количество билетов</span><b>{{ ticketReceiptBooking.ticket_qty || 0 }}</b></div>
+                  <div class="receipt-line total"><span>ИТОГО</span><b>{{ ticketReceiptBooking.total_amount }} {{ ticketReceiptBooking.currency || "RUB" }}</b></div>
+                  <div v-if="ticketReceiptBooking.refund?.status" class="receipt-line">
+                    <span>Статус возврата</span>
+                    <b>{{ refundStatusLabel(ticketReceiptBooking.refund.status) }}</b>
+                  </div>
+                  <div
+                    v-if="ticketReceiptBooking.refund?.status === 'rejected' && ticketReceiptBooking.refund?.admin_comment"
+                    class="receipt-line"
+                  >
+                    <span>Причина отказа</span>
+                    <b>{{ ticketReceiptBooking.refund.admin_comment }}</b>
+                  </div>
+                  <button
+                    v-if="!ticketReceiptBooking.refund || ticketReceiptBooking.refund.status === 'rejected'"
+                    class="refund-btn"
+                    :disabled="userRefundLoading"
+                    @click="openRefundConfirm(ticketReceiptBooking)"
+                  >
+                    Вернуть билет
+                  </button>
+                  <p v-if="userRefundError" class="error">{{ userRefundError }}</p>
+                  <p v-if="userRefundSuccess" class="success">{{ userRefundSuccess }}</p>
+                  <div class="receipt-qr">QR</div>
+                </div>
+              </div>
+
+              <div v-if="refundConfirmBooking" class="receipt-overlay" @click="closeRefundConfirm">
+                <div class="refund-confirm-modal" @click.stop>
+                  <h3>Подтверждение возврата</h3>
+                  <p>Вы уверены, что хотите отправить заявку на возврат билета по заказу #{{ refundConfirmBooking.order_id }}?</p>
+                  <div class="refund-confirm-actions">
+                    <button class="link-btn" @click="closeRefundConfirm">Отмена</button>
+                    <button class="refund-btn" :disabled="userRefundLoading" @click="requestRefundForBooking">
+                      {{ userRefundLoading ? "Отправляем..." : "Подтвердить возврат" }}
+                    </button>
+                  </div>
+                </div>
               </div>
             </section>
 
@@ -2150,6 +3192,44 @@ onUnmounted(() => {
                     <div class="booking-muted">{{ formatCabinetDate(ticket.starts_at) }} В· {{ ticket.venue_name || "-" }}</div>
                     <div class="booking-muted">{{ ticket.ticket_type || "Билет" }} · {{ ticket.unit_price }} {{ ticket.currency }}</div>
                   </div>
+                </article>
+              </div>
+            </section>
+
+            <section v-if="userCabinetTab === 'favorites'" class="cabinet-block">
+              <div class="cabinet-block-head">
+                <h2>Избранное</h2>
+              </div>
+              <div class="row-line"></div>
+              <p v-if="userFavoritesLoading">Загрузка избранного...</p>
+              <p v-if="userFavoritesError" class="error">{{ userFavoritesError }}</p>
+              <p v-if="!userFavoritesLoading && !userFavorites.length">В избранном пока нет мероприятий</p>
+              <div v-else class="user-booking-cards">
+                <article
+                  v-for="event in userFavorites"
+                  :key="`fav-${event.event_id}`"
+                  class="card main-event-card clickable"
+                  @click="navigate(`/event/${event.event_id}`)"
+                >
+                  <button
+                    class="favorite-heart active"
+                    @click="toggleFavorite(event.event_id, $event)"
+                    aria-label="Убрать из избранного"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 20.5 4.8 13.8A4.9 4.9 0 0 1 12 7.6a4.9 4.9 0 0 1 7.2 6.2L12 20.5z" />
+                    </svg>
+                  </button>
+                  <img
+                    v-if="event.cover_image_url"
+                    class="poster"
+                    :src="event.cover_image_url"
+                    :alt="event.title"
+                  />
+                  <div v-else class="poster poster-1"></div>
+                  <div v-if="event.min_price" class="price">ОТ {{ event.min_price }} ₽</div>
+                  <h2>{{ event.title }}</h2>
+                  <p>{{ formatEventDateTime(event.starts_at) }}<br />{{ event.venue_name || "-" }}</p>
                 </article>
               </div>
             </section>
@@ -2272,6 +3352,13 @@ onUnmounted(() => {
           >
             Добавление нового пользователя
           </button>
+          <button
+            class="admin-tile"
+            :class="{ active: adminTab === 'refunds' }"
+            @click="adminTab = 'refunds'"
+          >
+            Заявки на возврат
+          </button>
           <button class="admin-tile muted" disabled>Управление событиями (скоро)</button>
           <button class="admin-tile muted" disabled>Модерация организаторов (скоро)</button>
         </div>
@@ -2302,6 +3389,36 @@ onUnmounted(() => {
           </button>
           <p v-if="createUserError" class="error">{{ createUserError }}</p>
           <p v-if="createUserSuccess" class="success">{{ createUserSuccess }}</p>
+        </div>
+
+        <div v-if="adminTab === 'refunds'" class="admin-panel">
+          <h2>Заявки на возврат</h2>
+          <p v-if="adminRefundsLoading">Загрузка заявок...</p>
+          <p v-if="adminRefundsError" class="error">{{ adminRefundsError }}</p>
+          <p v-if="adminRefundsSuccess" class="success">{{ adminRefundsSuccess }}</p>
+          <p v-if="!adminRefundsLoading && !adminRefunds.length">Новых заявок нет</p>
+          <div v-else class="booking-list">
+            <article v-for="item in adminRefunds" :key="`refund-${item.refund_id}`" class="booking-card">
+              <div class="booking-head">
+                <div>Заявка #{{ item.refund_id }} · Заказ #{{ item.order_id }}</div>
+                <div class="booking-muted">{{ item.amount }} {{ item.currency }}</div>
+              </div>
+              <div class="booking-muted">Пользователь: {{ item.user_name || item.user_login || "-" }}</div>
+              <div class="booking-muted">Событие: {{ item.event_title || "-" }}</div>
+              <div class="booking-muted">Билетов: {{ item.ticket_qty || 0 }}</div>
+              <div class="booking-muted">Дата: {{ formatCabinetDate(item.starts_at) }}</div>
+              <div class="payment-form-actions">
+                <button class="auth-submit" @click="adminReviewRefund(item.refund_id, 'approve')">Одобрить</button>
+              </div>
+              <label>
+                Причина отклонения
+                <textarea v-model="adminRefundRejectComment[item.refund_id]" rows="2"></textarea>
+              </label>
+              <div class="payment-form-actions">
+                <button class="link-btn" @click="adminReviewRefund(item.refund_id, 'reject')">Отклонить</button>
+              </div>
+            </article>
+          </div>
         </div>
 
         <div v-if="profile" class="profile-grid">
@@ -2724,6 +3841,38 @@ onUnmounted(() => {
   border-radius: 24px;
   padding: 12px;
   background: #fff;
+  position: relative;
+}
+
+.favorite-heart {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  z-index: 2;
+}
+
+.favorite-heart svg {
+  width: 26px;
+  height: 26px;
+}
+
+.favorite-heart path {
+  fill: transparent;
+  stroke: #2c2c31;
+  stroke-width: 1.7;
+}
+
+.favorite-heart.active path {
+  fill: #ff4f4f;
+  stroke: #ff4f4f;
 }
 
 .clickable {
@@ -2784,6 +3933,378 @@ onUnmounted(() => {
 
 .tickets-btn {
   margin-top: 6px;
+}
+
+.ticket-screen {
+  min-height: 100vh;
+  padding-bottom: 12px;
+}
+
+.ticket-breadcrumb {
+  margin-bottom: 12px;
+}
+
+.ticket-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 500px);
+  gap: 16px;
+  align-items: stretch;
+  height: calc(100vh - 150px);
+}
+
+.ticket-left,
+.ticket-right {
+  background: #f6f6f8;
+  border: 1px solid #f0d78a;
+  border-radius: 22px;
+  padding: 14px 16px;
+  min-height: 0;
+}
+
+.ticket-left {
+  display: flex;
+  flex-direction: column;
+}
+
+.ticket-right {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+.ticket-left-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.ticket-map-title {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 700;
+}
+
+.ticket-timer {
+  font-size: 24px;
+  font-weight: 700;
+  color: #3a3a45;
+}
+
+.ticket-title {
+  margin: 0;
+  font-size: 44px;
+}
+
+.ticket-subtitle {
+  margin: 6px 0 14px;
+  color: #666;
+}
+
+.ticket-controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.ticket-controls label {
+  display: grid;
+  gap: 6px;
+}
+
+.ticket-controls select {
+  border: 1px solid #ddd;
+  border-radius: 10px;
+  padding: 6px 8px;
+  font-size: 14px;
+  font-family: "Arista Pro", sans-serif;
+}
+
+.hall-stage {
+  background: #f6f0de;
+  color: #4d4330;
+  text-align: center;
+  padding: 7px;
+  border-radius: 14px;
+  margin: 8px 0 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  font-size: 14px;
+}
+
+.seat-map {
+  display: grid;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.seat-row {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  gap: 12px;
+  align-items: center;
+}
+
+.row-label {
+  color: #555;
+  font-size: 14px;
+  text-align: center;
+}
+
+.row-seats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.seat-btn {
+  min-width: 38px;
+  height: 28px;
+  border: 1px solid #b8c694;
+  border-radius: 999px;
+  background: #99c260;
+  color: #2f2f35;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.seat-btn.selected {
+  background: #ffd039;
+  color: #2f2f35;
+  border-color: #ffd039;
+}
+
+.seat-btn.unavailable {
+  background: #e3e7ef;
+  color: #9a9a9a;
+  border-color: #d8dde8;
+  cursor: not-allowed;
+}
+
+.seat-legend {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin: 10px 0 8px;
+}
+
+.legend-chip {
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 13px;
+}
+
+.legend-chip.selected {
+  background: #ffd039;
+}
+
+.legend-chip.available {
+  background: #99c260;
+}
+
+.legend-chip.unavailable {
+  background: #e3e7ef;
+  color: #727784;
+}
+
+.clear-seat-btn {
+  width: 100%;
+  font-size: 18px;
+  padding: 8px 10px;
+}
+
+.ticket-event-card {
+  display: grid;
+  grid-template-columns: 1fr 190px;
+  gap: 10px;
+  border: 1px solid #e2e2e2;
+  border-radius: 14px;
+  padding: 10px;
+  background: #fff;
+}
+
+.ticket-event-cover {
+  width: 100%;
+  height: 128px;
+  object-fit: cover;
+  border-radius: 12px;
+}
+
+.ticket-event-cover-fallback {
+  background: linear-gradient(135deg, #ececec, #dedede);
+}
+
+.ticket-event-main h3 {
+  margin: 2px 0 6px;
+  font-size: 24px;
+  line-height: 1.02;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.ticket-event-meta {
+  font-size: 13px;
+  color: #4f4f58;
+  margin-bottom: 4px;
+  line-height: 1.2;
+}
+
+.ticket-right .ticket-controls {
+  margin: 10px 0;
+}
+
+.ticket-order-title {
+  margin: 6px 0 6px;
+  font-size: 26px;
+  font-weight: 700;
+}
+
+.ticket-order-seats {
+  background: #fff;
+  border: 1px solid #d8d8d8;
+  border-radius: 16px;
+}
+
+.ticket-order-seat-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  font-size: 16px;
+}
+
+.ticket-order-seat-row + .ticket-order-seat-row {
+  border-top: 1px solid #ececec;
+}
+
+.ticket-order-empty {
+  color: #7d7d86;
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+.ticket-order-totals {
+  margin-top: 8px;
+  border-top: 1px solid #e2e2e2;
+  padding-top: 8px;
+}
+
+.ticket-order-line {
+  margin-bottom: 4px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 16px;
+}
+
+.ticket-order-line.total {
+  font-weight: 700;
+}
+
+.ticket-confirm-btn {
+  font-size: 18px;
+  line-height: 1.15;
+  margin-top: 6px;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+
+.pay-btn {
+  margin-top: 8px;
+}
+
+.payment-screen {
+  min-height: 100vh;
+  padding-bottom: 12px;
+}
+
+.payment-title {
+  margin: 4px 0 2px;
+  font-size: 34px;
+  font-weight: 700;
+}
+
+.payment-subtitle {
+  margin: 0 0 10px;
+  color: #666;
+}
+
+.payment-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 520px);
+  gap: 16px;
+  align-items: stretch;
+  height: calc(100vh - 210px);
+}
+
+.payment-left,
+.payment-right {
+  background: #f6f6f8;
+  border: 1px solid #f0d78a;
+  border-radius: 22px;
+  padding: 14px 16px;
+  min-height: 0;
+}
+
+.payment-left {
+  display: flex;
+  flex-direction: column;
+}
+
+.payment-right {
+  overflow: auto;
+}
+
+.payment-left h2 {
+  margin: 0 0 8px;
+  font-size: 24px;
+}
+
+.payment-methods-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.payment-method-btn {
+  font-size: 14px;
+  padding: 8px 10px;
+}
+
+.payment-method-btn.active {
+  background: #ffd039;
+}
+
+.payment-card-preview {
+  margin-top: 12px;
+  display: grid;
+  gap: 8px;
+  background: #fff;
+  border: 1px solid #e6e6e6;
+  border-radius: 14px;
+  padding: 10px;
+}
+
+.payment-field {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.payment-submit-btn {
+  margin-top: auto;
+  font-size: 18px;
+}
+
+.payment-timer {
+  margin-bottom: 8px;
+  font-size: 18px;
 }
 
 .event-tabs-row {
@@ -3295,6 +4816,157 @@ onUnmounted(() => {
   gap: 10px;
 }
 
+.user-booking-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.user-booking-card h2 {
+  font-size: 30px;
+}
+
+.booking-meta-grid {
+  margin-top: 8px;
+  display: grid;
+  gap: 2px;
+}
+
+.user-booking-card {
+  position: relative;
+  padding-bottom: 56px;
+}
+
+.booking-ticket-btn {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: auto;
+  min-width: 96px;
+  padding: 8px 14px;
+  font-size: 16px;
+}
+
+.receipt-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.38);
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+
+.receipt-modal {
+  width: min(92vw, 420px);
+  max-height: 90vh;
+  overflow: auto;
+  background: #fff;
+  border-radius: 16px;
+  padding: 16px 14px;
+  border: 1px solid #e6e6e6;
+  position: relative;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.22);
+}
+
+.receipt-close {
+  position: absolute;
+  right: 8px;
+  top: 4px;
+  border: 0;
+  background: transparent;
+  font-size: 26px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.receipt-modal h3 {
+  margin: 2px 0 12px;
+  text-align: center;
+  font-size: 30px;
+}
+
+.receipt-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+
+.receipt-line span {
+  color: #555;
+}
+
+.receipt-line b {
+  text-align: right;
+  max-width: 52%;
+  overflow-wrap: anywhere;
+}
+
+.receipt-divider {
+  border-top: 1px dashed #cecece;
+  margin: 8px 0;
+}
+
+.receipt-line.total {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.receipt-qr {
+  margin: 12px auto 0;
+  width: 120px;
+  height: 120px;
+  border: 6px solid #111;
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
+
+.refund-btn {
+  margin-top: 10px;
+  width: 100%;
+  border: 0;
+  border-radius: 10px;
+  background: #e65353;
+  color: #fff;
+  font-size: 16px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+
+.refund-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.refund-confirm-modal {
+  width: min(92vw, 420px);
+  background: #fff;
+  border-radius: 14px;
+  border: 1px solid #e4e4e4;
+  padding: 16px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.22);
+}
+
+.refund-confirm-modal h3 {
+  margin: 0 0 8px;
+  font-size: 26px;
+}
+
+.refund-confirm-modal p {
+  margin: 0 0 12px;
+  color: #555;
+}
+
+.refund-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .booking-card {
   border: 1px solid #e8e8e8;
   border-radius: 12px;
@@ -3694,7 +5366,8 @@ onUnmounted(() => {
 }
 
 .admin-panel input,
-.admin-panel select {
+.admin-panel select,
+.admin-panel textarea {
   border: 1px solid #ddd;
   border-radius: 10px;
   padding: 10px 12px;
@@ -3758,6 +5431,36 @@ onUnmounted(() => {
 
   .event-top-grid {
     grid-template-columns: 1fr;
+  }
+
+  .ticket-layout {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+
+  .ticket-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .ticket-event-card {
+    grid-template-columns: 1fr;
+  }
+
+  .payment-layout {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+
+  .ticket-event-main h3 {
+    font-size: 42px;
+  }
+
+  .ticket-map-title {
+    font-size: 34px;
+  }
+
+  .ticket-timer {
+    font-size: 28px;
   }
 
   .reviews-head {

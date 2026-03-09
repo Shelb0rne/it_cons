@@ -1,8 +1,10 @@
 ﻿import json
-from datetime import datetime
+from decimal import Decimal
+from datetime import datetime, timedelta
 
 from django.contrib.auth.hashers import check_password, make_password
 from django.core import signing
+from django.db import transaction
 from django.db.models import Q
 from django.http import JsonResponse
 from django.utils import timezone
@@ -15,18 +17,23 @@ from .models import (
     Event,
     EventImage,
     EventSession,
+    Favorite,
     Order,
+    OrderTicket,
     OrganizerAccount,
     OrganizerDetails,
     OrganizerProfile,
+    Payment,
+    Refund,
     Reservation,
+    ReservationItem,
+    Seat,
     TicketType,
     UserAccount,
     UserPaymentMethod,
     UserPrivacySettings,
     Venue,
 )
-
 AUTH_SALT = "it_cons_auth"
 TOKEN_MAX_AGE_SECONDS = 60 * 60 * 24 * 7
 
@@ -185,39 +192,9 @@ def public_events(request):
     )
     payload = []
     for event in events:
-        all_sessions = list(event.sessions.all())
-        future_sessions = [s for s in all_sessions if s.starts_at >= now]
-
-        # Hide only events that have sessions and all of them are in the past.
-        if all_sessions and not future_sessions:
-            continue
-
-        first_session = None
-        if future_sessions:
-            future_sessions.sort(key=lambda x: x.starts_at)
-            first_session = future_sessions[0]
-
-        prices = []
-        for session in future_sessions:
-            for ticket in session.ticket_types.all():
-                prices.append(ticket.price)
-        min_price = min(prices) if prices else None
-
-        payload.append(
-            {
-                "event_id": event.event_id,
-                "title": event.title,
-                "description": event.description or "",
-                "status": event.status,
-                "category": event.category.name if event.category else None,
-                "venue_name": event.venue.name if event.venue else None,
-                "venue_city": event.venue.city if event.venue else None,
-                "venue_address": event.venue.address if event.venue else None,
-                "starts_at": first_session.starts_at.isoformat() if first_session else None,
-                "cover_image_url": _event_cover_url(request, event),
-                "min_price": str(min_price) if min_price is not None else None,
-            }
-        )
+        card = _public_event_card_payload(request, event, now)
+        if card:
+            payload.append(card)
     return JsonResponse({"events": payload})
 
 
@@ -231,6 +208,472 @@ def public_event_detail(request, event_id):
     if not event:
         return JsonResponse({"error": "Event not found"}, status=404)
     return JsonResponse(_event_detail_payload(request, event))
+
+
+def _public_event_card_payload(request, event, now):
+    all_sessions = list(event.sessions.all())
+    future_sessions = [s for s in all_sessions if s.starts_at >= now]
+
+    # Show only events that still have at least one future session.
+    if not future_sessions:
+        return None
+
+    first_session = None
+    if future_sessions:
+        future_sessions.sort(key=lambda x: x.starts_at)
+        first_session = future_sessions[0]
+
+    prices = []
+    for session in future_sessions:
+        for ticket in session.ticket_types.all():
+            prices.append(ticket.price)
+    min_price = min(prices) if prices else None
+
+    return {
+        "event_id": event.event_id,
+        "title": event.title,
+        "description": event.description or "",
+        "status": event.status,
+        "category": event.category.name if event.category else None,
+        "venue_name": event.venue.name if event.venue else None,
+        "venue_city": event.venue.city if event.venue else None,
+        "venue_address": event.venue.address if event.venue else None,
+        "starts_at": first_session.starts_at.isoformat() if first_session else None,
+        "cover_image_url": _event_cover_url(request, event),
+        "min_price": str(min_price) if min_price is not None else None,
+    }
+
+
+def _venue_layout_by_name(venue_name):
+    normalized = (venue_name or "").strip().lower()
+    if "театр музыки" in normalized:
+        return {"rows": 8, "seats_per_row": 12, "hall_name": "Большой зал"}
+    if "кц зил" in normalized:
+        return {"rows": 10, "seats_per_row": 16, "hall_name": "Главный зал"}
+    if "дом музыки" in normalized:
+        return {"rows": 12, "seats_per_row": 14, "hall_name": "Светлановский зал"}
+    if "александрин" in normalized:
+        return {"rows": 11, "seats_per_row": 15, "hall_name": "Основная сцена"}
+    if "бкз" in normalized:
+        return {"rows": 14, "seats_per_row": 18, "hall_name": "Концертный зал"}
+    return {"rows": 9, "seats_per_row": 12, "hall_name": "Основной зал"}
+
+
+def _ensure_venue_seats(venue):
+    existing = Seat.objects.filter(venue=venue)
+    if existing.exists():
+        return list(existing.order_by("row_number", "seat_number"))
+
+    layout = _venue_layout_by_name(venue.name)
+    created = []
+    for row in range(1, layout["rows"] + 1):
+        row_label = str(row)
+        for num in range(1, layout["seats_per_row"] + 1):
+            created.append(
+                Seat(
+                    venue=venue,
+                    hall_name=layout["hall_name"],
+                    row_number=row_label,
+                    seat_number=str(num),
+                )
+            )
+    Seat.objects.bulk_create(created)
+    return list(Seat.objects.filter(venue=venue).order_by("row_number", "seat_number"))
+
+
+def _occupied_seat_ids_for_session(session):
+    _expire_stale_holds()
+    now = timezone.now()
+    reserved_ids = set(
+        ReservationItem.objects.filter(
+            session=session,
+            reservation__expires_at__gte=now,
+        )
+        .exclude(seat_id__isnull=True)
+        .values_list("seat_id", flat=True)
+    )
+    ordered_ids = set(
+        OrderTicket.objects.filter(
+            session=session,
+            order__status__in={Order.STATUS_AWAITING_PAYMENT, Order.STATUS_PAID},
+        )
+        .exclude(seat_id__isnull=True)
+        .values_list("seat_id", flat=True)
+    )
+    return reserved_ids | ordered_ids
+
+
+def _expire_stale_holds():
+    now = timezone.now()
+    Reservation.objects.filter(expires_at__lt=now).delete()
+    (
+        Order.objects.filter(
+            status=Order.STATUS_AWAITING_PAYMENT,
+            created_at__lt=now - timedelta(minutes=15),
+        )
+        .update(status=Order.STATUS_EXPIRED)
+    )
+
+
+def _reservation_payload(request, reservation):
+    items = list(
+        reservation.items.select_related(
+            "session__event__venue",
+            "ticket_type",
+            "seat",
+        ).order_by("reservation_item_id")
+    )
+    if not items:
+        return None
+
+    first = items[0]
+    session = first.session
+    event = session.event if session else None
+    venue = event.venue if event else None
+    ticket_type = first.ticket_type
+    currency = ticket_type.currency if ticket_type else "RUB"
+
+    total_amount = Decimal("0")
+    seat_ids = []
+    selected_seats = []
+    for item in items:
+        price = item.ticket_type.price if item.ticket_type else Decimal("0")
+        total_amount += price
+        if item.seat_id:
+            seat_ids.append(item.seat_id)
+            selected_seats.append(
+                {
+                    "seat_id": item.seat_id,
+                    "row_number": item.seat.row_number if item.seat else None,
+                    "seat_number": item.seat.seat_number if item.seat else None,
+                }
+            )
+
+    return {
+        "reservation_id": reservation.reservation_id,
+        "expires_at": reservation.expires_at.isoformat() if reservation.expires_at else None,
+        "created_at": reservation.created_at.isoformat() if reservation.created_at else None,
+        "event_id": event.event_id if event else None,
+        "title": event.title if event else "",
+        "cover_image_url": _event_cover_url(request, event) if event else None,
+        "venue_name": venue.name if venue else "",
+        "venue_city": venue.city if venue else "",
+        "venue_address": venue.address if venue else "",
+        "session_id": session.session_id if session else None,
+        "starts_at": session.starts_at.isoformat() if session and session.starts_at else None,
+        "ticket_type_id": ticket_type.ticket_type_id if ticket_type else None,
+        "ticket_type_name": ticket_type.name if ticket_type else "",
+        "unit_price": str(ticket_type.price) if ticket_type else "0",
+        "currency": currency,
+        "seat_ids": seat_ids,
+        "selected_seats": selected_seats,
+        "qty": len(items),
+        "total_amount": str(total_amount),
+    }
+
+
+@require_GET
+def public_event_seat_map(request, event_id):
+    event = (
+        Event.objects.filter(event_id=event_id, status=Event.STATUS_PUBLISHED)
+        .select_related("venue")
+        .prefetch_related("sessions__ticket_types")
+        .first()
+    )
+    if not event:
+        return JsonResponse({"error": "Event not found"}, status=404)
+
+    sessions = list(event.sessions.all().order_by("starts_at"))
+    if not sessions:
+        return JsonResponse({"error": "No sessions for this event"}, status=400)
+
+    requested_session_id = request.GET.get("session_id")
+    active_session = None
+    if requested_session_id:
+        try:
+            req_id = int(requested_session_id)
+            active_session = next((s for s in sessions if s.session_id == req_id), None)
+        except ValueError:
+            active_session = None
+    if not active_session:
+        active_session = sessions[0]
+
+    seats = _ensure_venue_seats(event.venue)
+    occupied_ids = _occupied_seat_ids_for_session(active_session)
+
+    seats_payload = [
+        {
+            "seat_id": seat.seat_id,
+            "hall_name": seat.hall_name,
+            "row_number": seat.row_number,
+            "seat_number": seat.seat_number,
+            "is_available": seat.seat_id not in occupied_ids,
+        }
+        for seat in seats
+    ]
+
+    sessions_payload = []
+    for session in sessions:
+        sessions_payload.append(
+            {
+                "session_id": session.session_id,
+                "starts_at": session.starts_at.isoformat(),
+                "ends_at": session.ends_at.isoformat() if session.ends_at else None,
+                "ticket_types": [
+                    {
+                        "ticket_type_id": tt.ticket_type_id,
+                        "name": tt.name,
+                        "price": str(tt.price),
+                        "currency": tt.currency,
+                        "qty_total": tt.qty_total,
+                    }
+                    for tt in session.ticket_types.all().order_by("ticket_type_id")
+                ],
+            }
+        )
+
+    return JsonResponse(
+        {
+            "event_id": event.event_id,
+            "title": event.title,
+            "venue_name": event.venue.name if event.venue else "",
+            "venue_city": event.venue.city if event.venue else "",
+            "venue_address": event.venue.address if event.venue else "",
+            "cover_image_url": _event_cover_url(request, event),
+            "active_session_id": active_session.session_id,
+            "sessions": sessions_payload,
+            "seats": seats_payload,
+        }
+    )
+
+
+@csrf_exempt
+@require_POST
+def user_create_reservation(request):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    payload = _parse_json_body(request)
+    if payload is None:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    event_id = payload.get("event_id")
+    session_id = payload.get("session_id")
+    ticket_type_id = payload.get("ticket_type_id")
+    seat_ids_raw = payload.get("seat_ids") or []
+
+    if not event_id or not session_id or not ticket_type_id or not isinstance(seat_ids_raw, list):
+        return JsonResponse(
+            {"error": "event_id, session_id, ticket_type_id and seat_ids are required"},
+            status=400,
+        )
+
+    try:
+        seat_ids = sorted({int(x) for x in seat_ids_raw})
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "seat_ids must be a list of integer ids"}, status=400)
+    if not seat_ids:
+        return JsonResponse({"error": "Select at least one seat"}, status=400)
+
+    event = Event.objects.filter(event_id=event_id, status=Event.STATUS_PUBLISHED).select_related("venue").first()
+    if not event:
+        return JsonResponse({"error": "Event not found"}, status=404)
+
+    session = EventSession.objects.filter(session_id=session_id, event=event).first()
+    if not session:
+        return JsonResponse({"error": "Session not found"}, status=404)
+
+    ticket_type = TicketType.objects.filter(ticket_type_id=ticket_type_id, session=session).first()
+    if not ticket_type:
+        return JsonResponse({"error": "Ticket type not found"}, status=404)
+
+    seats = list(Seat.objects.filter(venue=event.venue, seat_id__in=seat_ids))
+    if len(seats) != len(seat_ids):
+        return JsonResponse({"error": "Some seats are invalid for this venue"}, status=400)
+
+    with transaction.atomic():
+        locked_ids = _occupied_seat_ids_for_session(session)
+        unavailable = [sid for sid in seat_ids if sid in locked_ids]
+        if unavailable:
+            return JsonResponse(
+                {
+                    "error": "Some seats are no longer available",
+                    "unavailable_seat_ids": unavailable,
+                },
+                status=409,
+            )
+
+        reservation = Reservation.objects.create(
+            user=user,
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+        by_id = {seat.seat_id: seat for seat in seats}
+        for sid in seat_ids:
+            ReservationItem.objects.create(
+                reservation=reservation,
+                session=session,
+                ticket_type=ticket_type,
+                seat=by_id[sid],
+            )
+
+    total_amount = ticket_type.price * len(seat_ids)
+    return JsonResponse(
+        {
+            "reservation_id": reservation.reservation_id,
+            "expires_at": reservation.expires_at.isoformat(),
+            "event_id": event.event_id,
+            "session_id": session.session_id,
+            "ticket_type_id": ticket_type.ticket_type_id,
+            "seat_ids": seat_ids,
+            "qty": len(seat_ids),
+            "unit_price": str(ticket_type.price),
+            "currency": ticket_type.currency,
+            "total_amount": str(total_amount),
+        },
+        status=201,
+    )
+
+
+@require_GET
+def user_reservation_detail(request, reservation_id):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    _expire_stale_holds()
+    reservation = (
+        Reservation.objects.filter(
+            reservation_id=reservation_id,
+            user=user,
+        )
+        .prefetch_related("items__session__event__venue", "items__ticket_type", "items__seat")
+        .first()
+    )
+    if not reservation:
+        return JsonResponse({"error": "Reservation not found"}, status=404)
+
+    if reservation.expires_at and reservation.expires_at < timezone.now():
+        reservation.delete()
+        return JsonResponse({"error": "Reservation expired"}, status=410)
+
+    data = _reservation_payload(request, reservation)
+    if not data:
+        reservation.delete()
+        return JsonResponse({"error": "Reservation has no items"}, status=410)
+    return JsonResponse(data)
+
+
+@csrf_exempt
+@require_POST
+def user_pay_reservation(request, reservation_id):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    payload = _parse_json_body(request)
+    if payload is None:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    payment_method_id = payload.get("payment_method_id")
+    selected_payment_method = None
+    if payment_method_id:
+        selected_payment_method = UserPaymentMethod.objects.filter(
+            payment_method_id=payment_method_id,
+            user=user,
+            status=UserPaymentMethod.STATUS_ACTIVE,
+        ).first()
+        if not selected_payment_method:
+            return JsonResponse({"error": "Payment method not found"}, status=404)
+
+    _expire_stale_holds()
+    with transaction.atomic():
+        reservation = (
+            Reservation.objects.select_for_update()
+            .filter(
+                reservation_id=reservation_id,
+                user=user,
+            )
+            .prefetch_related("items__session__event__venue", "items__ticket_type", "items__seat")
+            .first()
+        )
+        if not reservation:
+            return JsonResponse({"error": "Reservation not found"}, status=404)
+
+        now = timezone.now()
+        if reservation.expires_at and reservation.expires_at < now:
+            reservation.delete()
+            return JsonResponse({"error": "Reservation expired"}, status=410)
+
+        items = list(reservation.items.all())
+        if not items:
+            reservation.delete()
+            return JsonResponse({"error": "Reservation has no items"}, status=410)
+
+        for item in items:
+            if not item.seat_id:
+                return JsonResponse({"error": "Seat is required for reservation item"}, status=400)
+            occupied = _occupied_seat_ids_for_session(item.session)
+            if item.seat_id in occupied:
+                own_hold = ReservationItem.objects.filter(
+                    session=item.session,
+                    seat_id=item.seat_id,
+                    reservation=reservation,
+                ).exists()
+                if not own_hold:
+                    return JsonResponse(
+                        {
+                            "error": "Some seats are no longer available",
+                            "unavailable_seat_ids": [item.seat_id],
+                        },
+                        status=409,
+                    )
+
+        total_amount = Decimal("0")
+        currency = "RUB"
+        for item in items:
+            total_amount += item.ticket_type.price
+            currency = item.ticket_type.currency
+
+        order = Order.objects.create(
+            user=user,
+            status=Order.STATUS_PAID,
+            total_amount=total_amount,
+            currency=currency,
+            paid_at=now,
+        )
+
+        for item in items:
+            OrderTicket.objects.create(
+                order=order,
+                session=item.session,
+                ticket_type=item.ticket_type,
+                seat=item.seat,
+                unit_price=item.ticket_type.price,
+                currency=item.ticket_type.currency,
+            )
+
+        Payment.objects.create(
+            order=order,
+            provider_payment_id=(
+                selected_payment_method.provider_method_id if selected_payment_method else None
+            ),
+            amount=total_amount,
+            currency=currency,
+            confirmed_at=now,
+        )
+
+        reservation.delete()
+
+    return JsonResponse(
+        {
+            "order_id": order.order_id,
+            "status": order.status,
+            "paid_at": order.paid_at.isoformat() if order.paid_at else None,
+            "total_amount": str(order.total_amount),
+            "currency": order.currency,
+        }
+    )
 
 
 @csrf_exempt
@@ -437,51 +880,137 @@ def user_profile(request):
     return JsonResponse(_user_profile_payload(user))
 
 
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def user_favorites(request):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    if request.method == "GET":
+        now = timezone.now()
+        favorites = (
+            Favorite.objects.filter(user=user)
+            .select_related("event__category", "event__venue")
+            .prefetch_related("event__sessions__ticket_types")
+            .order_by("-id")
+        )
+        items = []
+        for favorite in favorites:
+            event = favorite.event
+            if not event or event.status != Event.STATUS_PUBLISHED:
+                continue
+            card = _public_event_card_payload(request, event, now)
+            if card:
+                items.append(card)
+        ids = [item["event_id"] for item in items]
+        return JsonResponse({"event_ids": ids, "events": items})
+
+    payload = _parse_json_body(request)
+    if payload is None:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    event_id = payload.get("event_id")
+    if not event_id:
+        return JsonResponse({"error": "event_id is required"}, status=400)
+
+    event = Event.objects.filter(event_id=event_id, status=Event.STATUS_PUBLISHED).first()
+    if not event:
+        return JsonResponse({"error": "Event not found"}, status=404)
+
+    Favorite.objects.get_or_create(user=user, event=event)
+    return JsonResponse({"ok": True}, status=201)
+
+
+@csrf_exempt
+@require_http_methods(["DELETE"])
+def user_favorite_detail(request, event_id):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    Favorite.objects.filter(user=user, event_id=event_id).delete()
+    return JsonResponse({"ok": True})
+
+
 @require_GET
 def user_bookings(request):
     user, err = _user_account_by_token(request)
     if err:
         return err
 
+    _expire_stale_holds()
     now = timezone.now()
 
-    reservations = (
-        Reservation.objects.filter(user=user, expires_at__gte=now)
-        .prefetch_related("items__session__event__venue", "items__ticket_type")
-        .order_by("-created_at")
-    )
     current_payload = []
-    for reservation in reservations:
-        items_payload = []
-        for item in reservation.items.all():
-            session = item.session
-            event = session.event if session else None
-            venue = event.venue if event else None
-            items_payload.append(
-                {
-                    "event_id": event.event_id if event else None,
-                    "event_title": event.title if event else "",
-                    "starts_at": session.starts_at.isoformat() if session and session.starts_at else None,
-                    "venue_name": venue.name if venue else "",
-                    "ticket_type": item.ticket_type.name if item.ticket_type else "",
-                }
-            )
-        current_payload.append(
-            {
-                "reservation_id": reservation.reservation_id,
-                "expires_at": reservation.expires_at.isoformat() if reservation.expires_at else None,
-                "created_at": reservation.created_at.isoformat() if reservation.created_at else None,
-                "items": items_payload,
-            }
-        )
 
     orders = (
         Order.objects.filter(user=user)
-        .prefetch_related("order_tickets__session__event__venue", "order_tickets__ticket_type")
+        .prefetch_related("order_tickets__session__event__venue", "order_tickets__ticket_type", "order_tickets__seat")
         .order_by("-created_at")
     )
+
+    for order in orders:
+        tickets = list(order.order_tickets.all())
+        if not tickets:
+            continue
+        starts = [t.session.starts_at for t in tickets if t.session and t.session.starts_at]
+        if not starts:
+            continue
+        event_start = min(starts)
+        if order.status == Order.STATUS_PAID and event_start >= now:
+            first_ticket = tickets[0]
+            event = first_ticket.session.event if first_ticket.session else None
+            venue = event.venue if event else None
+            latest_refund = order.refunds.order_by("-created_at").first()
+            ticket_items = []
+            for ticket in tickets:
+                ticket_items.append(
+                    {
+                        "ticket_type": ticket.ticket_type.name if ticket.ticket_type else "",
+                        "unit_price": str(ticket.unit_price),
+                        "currency": ticket.currency,
+                        "row_number": ticket.seat.row_number if ticket.seat else None,
+                        "seat_number": ticket.seat.seat_number if ticket.seat else None,
+                    }
+                )
+            current_payload.append(
+                {
+                    "kind": "paid_order",
+                    "order_id": order.order_id,
+                    "event_id": event.event_id if event else None,
+                    "event_title": event.title if event else "",
+                    "cover_image_url": _event_cover_url(request, event) if event else None,
+                    "starts_at": event_start.isoformat(),
+                    "venue_name": venue.name if venue else "",
+                    "ticket_qty": len(tickets),
+                    "total_amount": str(order.total_amount),
+                    "currency": order.currency,
+                    "status": "paid",
+                    "days_left": max(0, (event_start.date() - now.date()).days),
+                    "paid_at": order.paid_at.isoformat() if order.paid_at else None,
+                    "tickets": ticket_items,
+                    "refund": (
+                        {
+                            "refund_id": latest_refund.refund_id,
+                            "status": latest_refund.status,
+                            "admin_comment": latest_refund.admin_comment,
+                            "created_at": latest_refund.created_at.isoformat()
+                            if latest_refund.created_at
+                            else None,
+                            "reviewed_at": latest_refund.reviewed_at.isoformat()
+                            if latest_refund.reviewed_at
+                            else None,
+                        }
+                        if latest_refund
+                        else None
+                    ),
+                }
+            )
+
     history_payload = []
     for order in orders:
+        latest_refund = order.refunds.order_by("-created_at").first()
         tickets_payload = []
         for ticket in order.order_tickets.all():
             session = ticket.session
@@ -507,10 +1036,199 @@ def user_bookings(request):
                 "created_at": order.created_at.isoformat() if order.created_at else None,
                 "paid_at": order.paid_at.isoformat() if order.paid_at else None,
                 "tickets": tickets_payload,
+                "refund": (
+                    {
+                        "refund_id": latest_refund.refund_id,
+                        "status": latest_refund.status,
+                        "admin_comment": latest_refund.admin_comment,
+                        "created_at": latest_refund.created_at.isoformat()
+                        if latest_refund.created_at
+                        else None,
+                        "reviewed_at": latest_refund.reviewed_at.isoformat()
+                        if latest_refund.reviewed_at
+                        else None,
+                    }
+                    if latest_refund
+                    else None
+                ),
             }
         )
 
+    current_payload.sort(key=lambda x: x.get("starts_at") or "")
     return JsonResponse({"current": current_payload, "history": history_payload})
+
+
+@csrf_exempt
+@require_POST
+def user_request_refund(request, order_id):
+    user, err = _user_account_by_token(request)
+    if err:
+        return err
+
+    order = (
+        Order.objects.filter(order_id=order_id, user=user)
+        .prefetch_related("order_tickets__session")
+        .first()
+    )
+    if not order:
+        return JsonResponse({"error": "Order not found"}, status=404)
+    if order.status != Order.STATUS_PAID:
+        return JsonResponse({"error": "Refund is available only for paid orders"}, status=400)
+
+    now = timezone.now()
+    starts = [
+        ticket.session.starts_at
+        for ticket in order.order_tickets.all()
+        if ticket.session and ticket.session.starts_at
+    ]
+    if starts and min(starts) <= now:
+        return JsonResponse({"error": "Cannot request refund after event start"}, status=400)
+
+    pending = order.refunds.filter(
+        status__in=[Refund.STATUS_REQUESTED, Refund.STATUS_APPROVED, Refund.STATUS_PROCESSING]
+    ).exists()
+    if pending:
+        return JsonResponse({"error": "Refund request is already in progress"}, status=409)
+
+    refund = Refund.objects.create(
+        order=order,
+        status=Refund.STATUS_REQUESTED,
+        amount=order.total_amount,
+        currency=order.currency,
+    )
+    return JsonResponse(
+        {
+            "refund_id": refund.refund_id,
+            "status": refund.status,
+        },
+        status=201,
+    )
+
+
+@require_GET
+def admin_refunds(request):
+    token_payload, err = _require_admin_token(request)
+    if err:
+        return err
+    admin = AdminAccount.objects.filter(admin_id=token_payload.get("id")).first()
+    if not admin:
+        return JsonResponse({"error": "Admin account not found"}, status=404)
+
+    status_filter = (request.GET.get("status") or "").strip().lower()
+    qs = Refund.objects.select_related("order__user").order_by("-created_at")
+    if status_filter in {
+        Refund.STATUS_REQUESTED,
+        Refund.STATUS_APPROVED,
+        Refund.STATUS_PROCESSING,
+        Refund.STATUS_SUCCEEDED,
+        Refund.STATUS_REJECTED,
+    }:
+        qs = qs.filter(status=status_filter)
+
+    items = []
+    for refund in qs:
+        order = refund.order
+        user_obj = order.user if order else None
+        user_login = ""
+        user_name = ""
+        if user_obj:
+            user_login = user_obj.email or user_obj.phone or ""
+            user_name = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip()
+        tickets = (
+            order.order_tickets.select_related("session__event")
+            .all()
+            if order
+            else []
+        )
+        first_ticket = tickets[0] if tickets else None
+        event = first_ticket.session.event if first_ticket and first_ticket.session else None
+        starts = [
+            ticket.session.starts_at
+            for ticket in tickets
+            if ticket.session and ticket.session.starts_at
+        ]
+        items.append(
+            {
+                "refund_id": refund.refund_id,
+                "order_id": order.order_id if order else None,
+                "status": refund.status,
+                "amount": str(refund.amount),
+                "currency": refund.currency,
+                "admin_comment": refund.admin_comment,
+                "created_at": refund.created_at.isoformat() if refund.created_at else None,
+                "reviewed_at": refund.reviewed_at.isoformat() if refund.reviewed_at else None,
+                "user_id": user_obj.user_id if user_obj else None,
+                "user_name": user_name,
+                "user_login": user_login,
+                "event_id": event.event_id if event else None,
+                "event_title": event.title if event else "",
+                "starts_at": min(starts).isoformat() if starts else None,
+                "ticket_qty": len(tickets),
+            }
+        )
+    return JsonResponse({"items": items})
+
+
+@csrf_exempt
+@require_POST
+def admin_refund_review(request, refund_id):
+    token_payload, err = _require_admin_token(request)
+    if err:
+        return err
+    admin = AdminAccount.objects.filter(admin_id=token_payload.get("id")).first()
+    if not admin:
+        return JsonResponse({"error": "Admin account not found"}, status=404)
+
+    payload = _parse_json_body(request)
+    if payload is None:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    action = (payload.get("action") or "").strip().lower()
+    admin_comment = (payload.get("admin_comment") or "").strip()
+    if action not in {"approve", "reject"}:
+        return JsonResponse({"error": "action must be approve or reject"}, status=400)
+    if action == "reject" and not admin_comment:
+        return JsonResponse({"error": "admin_comment is required when rejecting"}, status=400)
+
+    with transaction.atomic():
+        refund = (
+            Refund.objects.select_for_update()
+            .select_related("order")
+            .prefetch_related("order__order_tickets")
+            .filter(refund_id=refund_id)
+            .first()
+        )
+        if not refund:
+            return JsonResponse({"error": "Refund request not found"}, status=404)
+        if refund.status != Refund.STATUS_REQUESTED:
+            return JsonResponse({"error": "Refund request already processed"}, status=409)
+
+        order = refund.order
+        if not order:
+            return JsonResponse({"error": "Order not found"}, status=404)
+
+        now = timezone.now()
+        if action == "approve":
+            refund.status = Refund.STATUS_SUCCEEDED
+            refund.admin_comment = admin_comment or "Возврат одобрен"
+            refund.reviewed_at = now
+            refund.save(update_fields=["status", "admin_comment", "reviewed_at"])
+
+            order.status = Order.STATUS_REFUNDED
+            order.save(update_fields=["status"])
+        else:
+            refund.status = Refund.STATUS_REJECTED
+            refund.admin_comment = admin_comment
+            refund.reviewed_at = now
+            refund.save(update_fields=["status", "admin_comment", "reviewed_at"])
+
+    return JsonResponse(
+        {
+            "refund_id": refund.refund_id,
+            "status": refund.status,
+            "admin_comment": refund.admin_comment,
+        }
+    )
 
 
 @csrf_exempt
@@ -1196,3 +1914,8 @@ def organizer_event_images(request, event_id):
             EventImage.objects.create(event=event, image=gallery_file, sort_order=last_sort + index)
 
     return JsonResponse(_event_detail_payload(request, event))
+
+
+
+
+
