@@ -328,6 +328,26 @@ class Seat(models.Model):
         ]
 
 
+class NearbyPlace(models.Model):
+    place_id = models.BigAutoField(primary_key=True)
+    venue = models.ForeignKey(
+        Venue,
+        on_delete=models.CASCADE,
+        db_column="venue_id",
+        related_name="nearby_places",
+    )
+    title = models.CharField(max_length=255)
+    description = models.TextField(null=True, blank=True)
+    working_hours = models.CharField(max_length=255, null=True, blank=True)
+    average_check = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    travel_time_minutes = models.PositiveIntegerField(null=True, blank=True)
+    image = models.FileField(upload_to="nearby_places/", null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "nearby_place"
+
+
 class Favorite(models.Model):
     user = models.ForeignKey(
         UserAccount,

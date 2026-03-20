@@ -16,8 +16,11 @@ function loadAuth() {
 
 const auth = ref(loadAuth());
 const loginForm = ref({ login: "", password: "" });
+const registerForm = ref({ full_name: "", login: "", password: "" });
 const loginError = ref("");
 const loginLoading = ref(false);
+const registerError = ref("");
+const registerLoading = ref(false);
 
 const profile = ref(null);
 const profileLoading = ref(false);
@@ -37,6 +40,28 @@ const adminRefundsError = ref("");
 const adminRefundsSuccess = ref("");
 const adminRefunds = ref([]);
 const adminRefundRejectComment = ref({});
+const adminModerationEventsLoading = ref(false);
+const adminModerationEventsError = ref("");
+const adminModerationEventsSuccess = ref("");
+const adminModerationEvents = ref([]);
+const adminModerationRejectComment = ref({});
+const adminNearbyPlacesLoading = ref(false);
+const adminNearbyPlacesError = ref("");
+const adminNearbyPlacesSuccess = ref("");
+const adminNearbyPlaces = ref([]);
+const adminNearbyVenues = ref([]);
+const adminNearbyPlaceEditId = ref(null);
+const adminNearbyImagePreview = ref("");
+const adminNearbyPlaceForm = ref({
+  venue_id: "",
+  title: "",
+  description: "",
+  working_hours: "",
+  average_check: "",
+  travel_time_minutes: "",
+  image: null,
+  clear_image: false,
+});
 const organizerCompany = ref({
   display_name: "",
   phone: "",
@@ -680,10 +705,11 @@ async function openOrganizerEventForEdit(eventId) {
 async function createOrganizerEvent(status = "draft") {
   if (!auth.value?.token) return;
   organizerEventsError.value = "";
+  organizerSuccess.value = "";
   try {
     const sessionsForSubmit = collectSessionsForSubmit();
     if (status === "published" && sessionsForSubmit.length === 0) {
-      organizerEventsError.value = "Для публикации добавьте хотя бы один сеанс.";
+      organizerEventsError.value = "Для отправки на модерацию добавьте хотя бы один сеанс.";
       return;
     }
 
@@ -716,6 +742,10 @@ async function createOrganizerEvent(status = "draft") {
     await uploadEventImages(eventId);
     resetEventForm();
     showCreateEventForm.value = false;
+    organizerSuccess.value =
+      status === "published"
+        ? "Мероприятие отправлено на модерацию."
+        : "Черновик сохранен.";
     await loadOrganizerEvents();
     await openOrganizerEvent(eventId);
   } catch (error) {
@@ -1117,7 +1147,7 @@ function handleRoute() {
       return;
     }
     if (auth.value.role === "admin") {
-      adminTab.value = "dashboard";
+      adminTab.value = "create-user";
     }
     loadProfile();
   }
@@ -1130,6 +1160,14 @@ function handleRoute() {
 const city = ref("Москва");
 const search = ref("");
 const selectedDateKey = ref(null);
+const showFiltersPanel = ref(false);
+const filters = ref({
+  priceFrom: "",
+  priceTo: "",
+  priceSort: "",
+  ageLabel: "",
+  venueName: "",
+});
 const calendarTrack = ref(null);
 const stickyMonthRef = ref(null);
 const stickyMonthLabel = ref("");
@@ -1165,12 +1203,50 @@ let paymentTimerHandle = null;
 
 const filteredEvents = computed(() => {
   const q = search.value.trim().toLowerCase();
-  return events.value.filter((e) => {
-    const matchesSearch = !q || `${e.title} ${e.venue}`.toLowerCase().includes(q);
+  const priceFrom = Number(filters.value.priceFrom);
+  const priceTo = Number(filters.value.priceTo);
+  const filtered = events.value.filter((e) => {
+    const haystack = `${e.title} ${e.venue} ${e.venueCity || ""}`.toLowerCase();
+    const matchesSearch = !q || haystack.includes(q);
     const matchesDate = !selectedDateKey.value || e.date_key === selectedDateKey.value;
-    return matchesSearch && matchesDate;
+    const matchesVenue = !filters.value.venueName || e.venueName === filters.value.venueName;
+    const eventPrice = Number(e.price);
+    const matchesPriceFrom =
+      !filters.value.priceFrom || !Number.isFinite(priceFrom) || (Number.isFinite(eventPrice) && eventPrice >= priceFrom);
+    const matchesPriceTo =
+      !filters.value.priceTo || !Number.isFinite(priceTo) || (Number.isFinite(eventPrice) && eventPrice <= priceTo);
+    const matchesAge = !filters.value.ageLabel || ageLabelFromRange(e.ageMin, e.ageMax) === filters.value.ageLabel;
+    return matchesSearch && matchesDate && matchesVenue && matchesPriceFrom && matchesPriceTo && matchesAge;
+  });
+
+  if (!filters.value.priceSort) {
+    return filtered;
+  }
+
+  return [...filtered].sort((a, b) => {
+    const priceA = Number(a.price);
+    const priceB = Number(b.price);
+    const safeA = Number.isFinite(priceA) ? priceA : Number.POSITIVE_INFINITY;
+    const safeB = Number.isFinite(priceB) ? priceB : Number.POSITIVE_INFINITY;
+    return filters.value.priceSort === "asc" ? safeA - safeB : safeB - safeA;
   });
 });
+
+const availableEventVenues = computed(() =>
+  [...new Set(events.value.map((event) => event.venueName).filter(Boolean))].sort((a, b) =>
+    a.localeCompare(b, "ru")
+  )
+);
+
+function resetEventFilters() {
+  filters.value = {
+    priceFrom: "",
+    priceTo: "",
+    priceSort: "",
+    ageLabel: "",
+    venueName: "",
+  };
+}
 
 function dateKeyFromIso(isoDate) {
   if (!isoDate) return null;
@@ -1211,6 +1287,30 @@ function bookingStatusLabel(status) {
   if (status === "paid") return "Оплачен";
   if (status === "awaiting_payment") return "Ожидает оплату";
   return status || "Неизвестно";
+}
+
+function organizerEventStatusLabel(status) {
+  if (status === "draft") return "Черновик";
+  if (status === "on_moderation") return "На модерации";
+  if (status === "published") return "Опубликовано";
+  if (status === "rejected") return "Отклонено";
+  if (status === "archived") return "Архив";
+  return status || "Неизвестно";
+}
+
+function resetAdminNearbyPlaceForm() {
+  adminNearbyPlaceEditId.value = null;
+  adminNearbyImagePreview.value = "";
+  adminNearbyPlaceForm.value = {
+    venue_id: "",
+    title: "",
+    description: "",
+    working_hours: "",
+    average_check: "",
+    travel_time_minutes: "",
+    image: null,
+    clear_image: false,
+  };
 }
 
 function refundStatusLabel(status) {
@@ -1283,6 +1383,39 @@ async function requestRefundForBooking() {
     userRefundError.value = error instanceof Error ? error.message : String(error);
   } finally {
     userRefundLoading.value = false;
+  }
+}
+
+async function submitRegister() {
+  registerLoading.value = true;
+  registerError.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        full_name: registerForm.value.full_name,
+        login: registerForm.value.login,
+        password: registerForm.value.password,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      registerError.value = payload.error || "Не удалось зарегистрироваться";
+      return;
+    }
+    persistAuth({
+      token: payload.token,
+      role: payload.user.role,
+      login: payload.user.login,
+    });
+    registerForm.value = { full_name: "", login: "", password: "" };
+    const nextPath = popPendingAuthRedirect();
+    navigate(nextPath || "/cabinet");
+  } catch (error) {
+    registerError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    registerLoading.value = false;
   }
 }
 
@@ -1486,7 +1619,11 @@ async function loadPublicEvents() {
       date: formatEventDateTime(event.starts_at),
       date_key: dateKeyFromIso(event.starts_at),
       venue: event.venue_name || event.venue_address || "-",
+      venueName: event.venue_name || "",
+      venueCity: event.venue_city || "",
       price: event.min_price,
+      ageMin: event.age_min,
+      ageMax: event.age_max,
       cover_image_url: event.cover_image_url,
     }));
   } catch (error) {
@@ -1686,6 +1823,192 @@ async function adminReviewRefund(refundId, action) {
     await loadAdminRefunds();
   } catch (error) {
     adminRefundsError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function loadAdminModerationEvents() {
+  if (!auth.value?.token) return;
+  adminModerationEventsLoading.value = true;
+  adminModerationEventsError.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/admin/events/moderation`, {
+      headers: {
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      adminModerationEventsError.value =
+        payload.error || "Не удалось загрузить мероприятия на модерации";
+      return;
+    }
+    adminModerationEvents.value = payload.items || [];
+  } catch (error) {
+    adminModerationEventsError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    adminModerationEventsLoading.value = false;
+  }
+}
+
+async function adminReviewEventModeration(eventId, action) {
+  if (!auth.value?.token) return;
+  adminModerationEventsSuccess.value = "";
+  adminModerationEventsError.value = "";
+  const comment = (adminModerationRejectComment.value[eventId] || "").trim();
+  if (action === "reject" && !comment) {
+    adminModerationEventsError.value = "Укажите причину отклонения";
+    return;
+  }
+  try {
+    const response = await fetch(`${apiBase}/api/admin/events/${eventId}/review`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+      body: JSON.stringify({
+        action,
+        moderation_comment: comment,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      adminModerationEventsError.value =
+        payload.error || "Не удалось обработать мероприятие";
+      return;
+    }
+    adminModerationEventsSuccess.value =
+      action === "publish"
+        ? "Мероприятие опубликовано"
+        : "Мероприятие отклонено";
+    delete adminModerationRejectComment.value[eventId];
+    await loadAdminModerationEvents();
+  } catch (error) {
+    adminModerationEventsError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function loadAdminNearbyPlaces() {
+  if (!auth.value?.token) return;
+  adminNearbyPlacesLoading.value = true;
+  adminNearbyPlacesError.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/admin/nearby-places`, {
+      headers: {
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      adminNearbyPlacesError.value = payload.error || "Не удалось загрузить места рядом";
+      return;
+    }
+    adminNearbyPlaces.value = payload.items || [];
+    adminNearbyVenues.value = payload.venues || [];
+  } catch (error) {
+    adminNearbyPlacesError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    adminNearbyPlacesLoading.value = false;
+  }
+}
+
+function onPickAdminNearbyImage(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  adminNearbyPlaceForm.value.image = file;
+  adminNearbyPlaceForm.value.clear_image = false;
+  adminNearbyImagePreview.value = URL.createObjectURL(file);
+  event.target.value = "";
+}
+
+function startEditAdminNearbyPlace(place) {
+  adminNearbyPlaceEditId.value = place.place_id;
+  adminNearbyImagePreview.value = place.image_url || "";
+  adminNearbyPlaceForm.value = {
+    venue_id: String(place.venue_id || ""),
+    title: place.title || "",
+    description: place.description || "",
+    working_hours: place.working_hours || "",
+    average_check: place.average_check || "",
+    travel_time_minutes: place.travel_time_minutes || "",
+    image: null,
+    clear_image: false,
+  };
+}
+
+function clearAdminNearbyImage() {
+  adminNearbyPlaceForm.value.image = null;
+  adminNearbyPlaceForm.value.clear_image = true;
+  adminNearbyImagePreview.value = "";
+}
+
+async function submitAdminNearbyPlace() {
+  if (!auth.value?.token) return;
+  adminNearbyPlacesSuccess.value = "";
+  adminNearbyPlacesError.value = "";
+  const formData = new FormData();
+  formData.append("venue_id", adminNearbyPlaceForm.value.venue_id);
+  formData.append("title", adminNearbyPlaceForm.value.title);
+  formData.append("description", adminNearbyPlaceForm.value.description);
+  formData.append("working_hours", adminNearbyPlaceForm.value.working_hours);
+  formData.append("average_check", adminNearbyPlaceForm.value.average_check);
+  formData.append("travel_time_minutes", adminNearbyPlaceForm.value.travel_time_minutes);
+  if (adminNearbyPlaceForm.value.image) {
+    formData.append("image", adminNearbyPlaceForm.value.image);
+  }
+  if (adminNearbyPlaceForm.value.clear_image) {
+    formData.append("clear_image", "1");
+  }
+
+  const isEdit = Boolean(adminNearbyPlaceEditId.value);
+  const url = isEdit
+    ? `${apiBase}/api/admin/nearby-places/${adminNearbyPlaceEditId.value}`
+    : `${apiBase}/api/admin/nearby-places/create`;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+      body: formData,
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      adminNearbyPlacesError.value = payload.error || "Не удалось сохранить место";
+      return;
+    }
+    adminNearbyPlacesSuccess.value = isEdit ? "Место обновлено" : "Место добавлено";
+    resetAdminNearbyPlaceForm();
+    await loadAdminNearbyPlaces();
+  } catch (error) {
+    adminNearbyPlacesError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function deleteAdminNearbyPlace(placeId) {
+  if (!auth.value?.token || !placeId) return;
+  adminNearbyPlacesSuccess.value = "";
+  adminNearbyPlacesError.value = "";
+  try {
+    const response = await fetch(`${apiBase}/api/admin/nearby-places/${placeId}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${auth.value.token}`,
+      },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      adminNearbyPlacesError.value = payload.error || "Не удалось удалить место";
+      return;
+    }
+    adminNearbyPlacesSuccess.value = "Место удалено";
+    if (adminNearbyPlaceEditId.value === placeId) {
+      resetAdminNearbyPlaceForm();
+    }
+    await loadAdminNearbyPlaces();
+  } catch (error) {
+    adminNearbyPlacesError.value = error instanceof Error ? error.message : String(error);
   }
 }
 
@@ -2089,6 +2412,14 @@ watch(currentPath, async () => {
 watch(adminTab, async (tab) => {
   if (tab === "refunds" && auth.value?.role === "admin") {
     await loadAdminRefunds();
+    return;
+  }
+  if (tab === "event-moderation" && auth.value?.role === "admin") {
+    await loadAdminModerationEvents();
+    return;
+  }
+  if (tab === "nearby-places" && auth.value?.role === "admin") {
+    await loadAdminNearbyPlaces();
   }
 });
 
@@ -2206,8 +2537,51 @@ onUnmounted(() => {
 
       <section class="controls">
         <div class="left-controls">
-          <button class="soft">Сортировка ∨</button>
-          <button class="soft">Фильтры</button>
+          <button class="soft" @click="showFiltersPanel = !showFiltersPanel">
+            Фильтры
+          </button>
+        </div>
+      </section>
+
+      <section v-if="showFiltersPanel" class="filters-panel">
+        <div class="filters-grid">
+          <label>
+            Цена от
+            <input v-model="filters.priceFrom" type="number" min="0" placeholder="0" />
+          </label>
+          <label>
+            Цена до
+            <input v-model="filters.priceTo" type="number" min="0" placeholder="10000" />
+          </label>
+          <label>
+            Сортировка цены
+            <select v-model="filters.priceSort">
+              <option value="">Без сортировки</option>
+              <option value="asc">По возрастанию</option>
+              <option value="desc">По убыванию</option>
+            </select>
+          </label>
+          <label>
+            Возраст
+            <select v-model="filters.ageLabel">
+              <option value="">Любой возраст</option>
+              <option v-for="option in ageOptions" :key="`filter-age-${option.label}`" :value="option.label">
+                {{ option.label }}
+              </option>
+            </select>
+          </label>
+          <label>
+            Место проведения
+            <select v-model="filters.venueName">
+              <option value="">Любая площадка</option>
+              <option v-for="venueName in availableEventVenues" :key="`filter-venue-${venueName}`" :value="venueName">
+                {{ venueName }}
+              </option>
+            </select>
+          </label>
+        </div>
+        <div class="filters-actions">
+          <button class="link-btn" @click="resetEventFilters">Сбросить</button>
         </div>
       </section>
 
@@ -2377,7 +2751,25 @@ onUnmounted(() => {
 
         <section class="event-nearby-block">
           <h2 class="nearby-title">Места рядом</h2>
-          <div class="empty-nearby"></div>
+          <div v-if="publicEvent.nearby_places?.length" class="nearby-grid">
+            <article v-for="place in publicEvent.nearby_places" :key="`nearby-${place.place_id}`" class="nearby-card">
+              <img v-if="place.image_url" :src="place.image_url" :alt="place.title" class="nearby-card-image" />
+              <div v-else class="nearby-card-image nearby-card-empty">Без фото</div>
+              <div class="nearby-card-tags">
+                <span v-if="place.average_check" class="nearby-chip">Ср чек {{ place.average_check }} ₽</span>
+                <span v-if="place.travel_time_minutes" class="nearby-chip nearby-chip-light">
+                  {{ place.travel_time_minutes }} мин
+                </span>
+              </div>
+              <h3>{{ place.title }}</h3>
+              <p>{{ place.description || "Описание отсутствует" }}</p>
+              <div class="nearby-meta">
+                <span v-if="place.working_hours">Часы работы: {{ place.working_hours }}</span>
+                <span v-if="place.average_check">Средний чек: {{ place.average_check }} ₽</span>
+              </div>
+            </article>
+          </div>
+          <div v-else class="empty-nearby">Пока нет добавленных мест рядом</div>
         </section>
       </section>
     </main>
@@ -2635,9 +3027,46 @@ onUnmounted(() => {
           <button class="auth-submit" :disabled="loginLoading" @click="submitLogin">
             {{ loginLoading ? "Входим..." : "Войти" }}
           </button>
+          <button class="link-btn" @click="navigate('/register')">Зарегистрироваться</button>
           <button class="link-btn" @click="navigate('/')">На главную</button>
         </div>
         <p v-if="loginError" class="error">{{ loginError }}</p>
+      </section>
+    </main>
+
+    <main v-else-if="currentPath === '/register'" class="auth-screen">
+      <section class="auth-card">
+        <h1>Регистрация</h1>
+        <label>
+          ФИО
+          <input v-model="registerForm.full_name" type="text" autocomplete="off" />
+        </label>
+        <label>
+          Логин
+          <input
+            v-model="registerForm.login"
+            type="text"
+            autocomplete="off"
+            placeholder="email или телефон"
+          />
+        </label>
+        <label>
+          Пароль
+          <input
+            v-model="registerForm.password"
+            type="password"
+            autocomplete="new-password"
+            @keyup.enter="submitRegister"
+          />
+        </label>
+        <div class="login-actions">
+          <button class="auth-submit" :disabled="registerLoading" @click="submitRegister">
+            {{ registerLoading ? "Регистрируем..." : "Зарегистрироваться" }}
+          </button>
+          <button class="link-btn" @click="navigate('/login')">Уже есть аккаунт</button>
+          <button class="link-btn" @click="navigate('/')">На главную</button>
+        </div>
+        <p v-if="registerError" class="error">{{ registerError }}</p>
       </section>
     </main>
 
@@ -2828,7 +3257,7 @@ onUnmounted(() => {
                       Сохранить
                     </button>
                     <button class="yellow-btn publish" @click="createOrganizerEvent('published')">
-                      Опубликовать
+                      Отправить на модерацию
                     </button>
                   </div>
                 </div>
@@ -2855,9 +3284,12 @@ onUnmounted(() => {
                   <div v-else class="event-card-cover no-cover">Без фото</div>
                   <div class="event-card-title">{{ event.title }}</div>
                   <div class="event-meta">
-                    Статус: {{ event.status }}
+                    Статус: {{ organizerEventStatusLabel(event.status) }}
                   </div>
                   <div class="event-meta">{{ event.category || "Без категории" }}</div>
+                  <div v-if="event.status === 'rejected' && event.moderation_comment" class="event-meta reject-reason">
+                    Причина: {{ event.moderation_comment }}
+                  </div>
                 </button>
               </div>
 
@@ -3359,7 +3791,20 @@ onUnmounted(() => {
           >
             Заявки на возврат
           </button>
-          <button class="admin-tile muted" disabled>Управление событиями (скоро)</button>
+          <button
+            class="admin-tile"
+            :class="{ active: adminTab === 'event-moderation' }"
+            @click="adminTab = 'event-moderation'"
+          >
+            Модерация мероприятий
+          </button>
+          <button
+            class="admin-tile"
+            :class="{ active: adminTab === 'nearby-places' }"
+            @click="adminTab = 'nearby-places'"
+          >
+            Места рядом
+          </button>
           <button class="admin-tile muted" disabled>Модерация организаторов (скоро)</button>
         </div>
 
@@ -3416,6 +3861,149 @@ onUnmounted(() => {
               </label>
               <div class="payment-form-actions">
                 <button class="link-btn" @click="adminReviewRefund(item.refund_id, 'reject')">Отклонить</button>
+              </div>
+            </article>
+          </div>
+        </div>
+
+        <div v-if="adminTab === 'event-moderation'" class="admin-panel">
+          <h2>Модерация мероприятий</h2>
+          <p v-if="adminModerationEventsLoading">Загрузка мероприятий...</p>
+          <p v-if="adminModerationEventsError" class="error">{{ adminModerationEventsError }}</p>
+          <p v-if="adminModerationEventsSuccess" class="success">{{ adminModerationEventsSuccess }}</p>
+          <p v-if="!adminModerationEventsLoading && !adminModerationEvents.length">
+            Новых мероприятий на модерации нет
+          </p>
+          <div v-else class="booking-list">
+            <article
+              v-for="event in adminModerationEvents"
+              :key="`moderation-${event.event_id}`"
+              class="booking-card moderation-card"
+            >
+              <div class="booking-head">
+                <div>Мероприятие #{{ event.event_id }} · {{ event.title }}</div>
+                <div class="booking-muted">{{ organizerEventStatusLabel(event.status) }}</div>
+              </div>
+              <div class="moderation-grid">
+                <div>
+                  <div class="booking-muted">Организатор: {{ event.organizer?.display_name || "-" }}</div>
+                  <div class="booking-muted">Логин: {{ event.organizer?.login || "-" }}</div>
+                  <div class="booking-muted">Категория: {{ event.category_name || "-" }}</div>
+                  <div class="booking-muted">Город: {{ event.venue_city || "-" }}</div>
+                  <div class="booking-muted">Адрес: {{ event.venue_address || "-" }}</div>
+                  <div class="booking-muted">
+                    Возраст: {{ ageLabelFromRange(event.age_min, event.age_max) || "Не указан" }}
+                  </div>
+                </div>
+                <img
+                  v-if="event.cover_image_url"
+                  :src="event.cover_image_url"
+                  alt="cover"
+                  class="moderation-cover"
+                />
+              </div>
+              <div class="booking-item-title">Описание</div>
+              <p class="long-text">{{ event.description || "Описание не заполнено" }}</p>
+              <div class="booking-item-title">Сеансы</div>
+              <div v-if="event.sessions?.length" class="sessions-list moderation-sessions">
+                <div
+                  v-for="session in event.sessions"
+                  :key="`admin-session-${event.event_id}-${session.session_id}`"
+                  class="session-item"
+                >
+                  <span>{{ formatCabinetDate(session.starts_at) }}</span>
+                  <span>{{ session.ticket_types?.length || 0 }} типов билетов</span>
+                </div>
+              </div>
+              <p v-else class="booking-muted">Сеансы не добавлены</p>
+              <div class="payment-form-actions">
+                <button class="auth-submit" @click="adminReviewEventModeration(event.event_id, 'publish')">
+                  Опубликовать
+                </button>
+              </div>
+              <label>
+                Причина отклонения
+                <textarea v-model="adminModerationRejectComment[event.event_id]" rows="3"></textarea>
+              </label>
+              <div class="payment-form-actions">
+                <button class="link-btn" @click="adminReviewEventModeration(event.event_id, 'reject')">
+                  Отклонить
+                </button>
+              </div>
+            </article>
+          </div>
+        </div>
+
+        <div v-if="adminTab === 'nearby-places'" class="admin-panel">
+          <h2>Места рядом</h2>
+          <p v-if="adminNearbyPlacesLoading">Загрузка мест...</p>
+          <p v-if="adminNearbyPlacesError" class="error">{{ adminNearbyPlacesError }}</p>
+          <p v-if="adminNearbyPlacesSuccess" class="success">{{ adminNearbyPlacesSuccess }}</p>
+          <label>
+            Площадка
+            <select v-model="adminNearbyPlaceForm.venue_id">
+              <option value="">Выберите площадку</option>
+              <option v-for="venue in adminNearbyVenues" :key="`nearby-venue-${venue.venue_id}`" :value="String(venue.venue_id)">
+                {{ venue.label }} · {{ venue.address }}
+              </option>
+            </select>
+          </label>
+          <label>
+            Название места
+            <input v-model="adminNearbyPlaceForm.title" type="text" />
+          </label>
+          <label>
+            Описание
+            <textarea v-model="adminNearbyPlaceForm.description" rows="3"></textarea>
+          </label>
+          <div class="moderation-grid nearby-form-grid">
+            <label>
+              Часы работы
+              <input v-model="adminNearbyPlaceForm.working_hours" type="text" placeholder="10:00–22:00" />
+            </label>
+            <label>
+              Средний чек
+              <input v-model="adminNearbyPlaceForm.average_check" type="number" min="0" step="0.01" />
+            </label>
+            <label>
+              Время пути, мин
+              <input v-model="adminNearbyPlaceForm.travel_time_minutes" type="number" min="0" />
+            </label>
+          </div>
+          <label>
+            Картинка
+            <input type="file" accept="image/*" @change="onPickAdminNearbyImage" />
+          </label>
+          <div v-if="adminNearbyImagePreview" class="nearby-admin-preview-wrap">
+            <img :src="adminNearbyImagePreview" alt="preview" class="nearby-admin-preview" />
+            <button class="link-btn" @click="clearAdminNearbyImage">Убрать картинку</button>
+          </div>
+          <div class="payment-form-actions">
+            <button class="auth-submit" @click="submitAdminNearbyPlace">
+              {{ adminNearbyPlaceEditId ? "Сохранить изменения" : "Добавить место" }}
+            </button>
+            <button class="link-btn" @click="resetAdminNearbyPlaceForm">Сбросить</button>
+          </div>
+
+          <div class="booking-list">
+            <article v-for="place in adminNearbyPlaces" :key="`admin-nearby-${place.place_id}`" class="booking-card">
+              <div class="booking-head">
+                <div>{{ place.title }}</div>
+                <div class="booking-muted">{{ place.venue_city }} · {{ place.venue_name }}</div>
+              </div>
+              <div class="moderation-grid">
+                <div>
+                  <div class="booking-muted">Адрес: {{ place.venue_address }}</div>
+                  <div class="booking-muted">Часы работы: {{ place.working_hours || "-" }}</div>
+                  <div class="booking-muted">Средний чек: {{ place.average_check ? `${place.average_check} ₽` : "-" }}</div>
+                  <div class="booking-muted">Время пути: {{ place.travel_time_minutes ? `${place.travel_time_minutes} мин` : "-" }}</div>
+                  <p class="long-text">{{ place.description || "Описание отсутствует" }}</p>
+                </div>
+                <img v-if="place.image_url" :src="place.image_url" alt="place" class="moderation-cover" />
+              </div>
+              <div class="payment-form-actions">
+                <button class="link-btn" @click="startEditAdminNearbyPlace(place)">Изменить</button>
+                <button class="link-btn danger-link" @click="deleteAdminNearbyPlace(place.place_id)">Удалить</button>
               </div>
             </article>
           </div>
@@ -3783,6 +4371,43 @@ onUnmounted(() => {
 .left-controls {
   display: flex;
   gap: 8px;
+}
+
+.filters-panel {
+  margin-top: 12px;
+  border: 1px solid #e7e2d5;
+  border-radius: 20px;
+  background: #fffaf1;
+  padding: 16px 18px;
+}
+
+.filters-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.filters-grid label {
+  display: grid;
+  gap: 6px;
+  font-size: 16px;
+  color: #2c2c31;
+}
+
+.filters-grid input,
+.filters-grid select {
+  border: 1px solid #ddd4be;
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 16px;
+  font-family: "Arista Pro", sans-serif;
+  background: #fff;
+}
+
+.filters-actions {
+  margin-top: 12px;
+  display: flex;
+  justify-content: flex-end;
 }
 
 .soft {
@@ -4366,6 +4991,81 @@ onUnmounted(() => {
 
 .empty-nearby {
   min-height: 80px;
+  display: flex;
+  align-items: center;
+  color: #7d7d84;
+}
+
+.nearby-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 360px));
+  gap: 16px;
+  align-items: start;
+}
+
+.nearby-card {
+  border: 1px solid #ececec;
+  border-radius: 18px;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  background: #fffdf8;
+  width: 100%;
+  max-width: 360px;
+}
+
+.nearby-card-image {
+  width: 100%;
+  height: 180px;
+  object-fit: contain;
+  object-position: center;
+  border-radius: 16px;
+  background: #f2f2f2;
+}
+
+.nearby-card-empty {
+  display: grid;
+  place-items: center;
+  color: #7d7d84;
+}
+
+.nearby-card-tags {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.nearby-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #ff7264;
+  color: #fff;
+  font-size: 14px;
+}
+
+.nearby-chip-light {
+  background: #ffd039;
+  color: #2c2c31;
+}
+
+.nearby-card h3 {
+  margin: 0;
+  font-size: 26px;
+  line-height: 1;
+}
+
+.nearby-card p {
+  margin: 0;
+  color: #56565d;
+}
+
+.nearby-meta {
+  display: grid;
+  gap: 4px;
+  font-size: 14px;
+  color: #2c2c31;
 }
 
 .reviews-head {
@@ -5317,6 +6017,10 @@ onUnmounted(() => {
   font-size: 14px;
 }
 
+.reject-reason {
+  color: #c64232;
+}
+
 .admin-tiles {
   margin: 8px 0 14px;
   display: grid;
@@ -5375,6 +6079,49 @@ onUnmounted(() => {
   font-family: "Arista Pro", sans-serif;
 }
 
+.moderation-card {
+  gap: 12px;
+}
+
+.moderation-grid {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.moderation-cover {
+  width: 180px;
+  height: 120px;
+  object-fit: cover;
+  border-radius: 12px;
+  border: 1px solid #e5e5e5;
+  flex-shrink: 0;
+}
+
+.moderation-sessions {
+  margin-bottom: 8px;
+}
+
+.nearby-form-grid {
+  align-items: end;
+}
+
+.nearby-admin-preview-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.nearby-admin-preview {
+  width: 160px;
+  height: 100px;
+  object-fit: cover;
+  border-radius: 12px;
+  border: 1px solid #e5e5e5;
+}
+
 .success {
   color: #1f8b3d;
 }
@@ -5404,6 +6151,10 @@ onUnmounted(() => {
 
   .cabinet-grid {
     grid-template-columns: 1fr;
+  }
+
+  .filters-grid {
+    grid-template-columns: 1fr 1fr;
   }
 
   .cabinet-info-grid {
@@ -5489,6 +6240,10 @@ onUnmounted(() => {
   .hero {
     aspect-ratio: 16 / 9;
     border-radius: 24px;
+  }
+
+  .filters-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

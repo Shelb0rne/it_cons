@@ -18,6 +18,7 @@ from .models import (
     EventImage,
     EventSession,
     Favorite,
+    NearbyPlace,
     Order,
     OrderTicket,
     OrganizerAccount,
@@ -234,6 +235,8 @@ def _public_event_card_payload(request, event, now):
         "title": event.title,
         "description": event.description or "",
         "status": event.status,
+        "age_min": event.age_min,
+        "age_max": event.age_max,
         "category": event.category.name if event.category else None,
         "venue_name": event.venue.name if event.venue else None,
         "venue_city": event.venue.city if event.venue else None,
@@ -710,6 +713,62 @@ def login_view(request):
             "token": token,
             "user": token_payload,
         }
+    )
+
+
+@csrf_exempt
+@require_POST
+def register_view(request):
+    payload = _parse_json_body(request)
+    if not payload:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    full_name = (payload.get("full_name") or "").strip()
+    login = (payload.get("login") or "").strip()
+    password = payload.get("password") or ""
+
+    if not full_name or not login or not password:
+        return JsonResponse({"error": "full_name, login and password are required"}, status=400)
+
+    if "@" in login:
+        email = login
+        phone = None
+    else:
+        email = None
+        phone = login
+
+    parts = full_name.split()
+    first_name = parts[0]
+    last_name = " ".join(parts[1:]) if len(parts) > 1 else "-"
+
+    if email and UserAccount.objects.filter(email__iexact=email).exists():
+        return JsonResponse({"error": "User with this email already exists"}, status=409)
+    if phone and UserAccount.objects.filter(phone=phone).exists():
+        return JsonResponse({"error": "User with this phone already exists"}, status=409)
+
+    account = UserAccount.objects.create(
+        email=email,
+        phone=phone,
+        password_hash=make_password(password),
+        first_name=first_name,
+        last_name=last_name,
+        status=UserAccount.STATUS_ACTIVE,
+    )
+
+    token_payload = {
+        "role": "user",
+        "id": account.user_id,
+        "login": account.email or account.phone or "",
+    }
+    token = _issue_token(token_payload)
+
+    return JsonResponse(
+        {
+            "token": token,
+            "user": token_payload,
+            "full_name": f"{account.first_name} {account.last_name}".strip(),
+        },
+        status=201,
     )
 
 
@@ -1619,6 +1678,22 @@ def _event_cover_url(request, event):
     return request.build_absolute_uri(event.cover_image_url)
 
 
+def _nearby_place_payload(request, place):
+    image_url = None
+    if place.image:
+        image_url = _event_image_url(request, place.image)
+    return {
+        "place_id": place.place_id,
+        "venue_id": place.venue_id,
+        "title": place.title,
+        "description": place.description or "",
+        "working_hours": place.working_hours or "",
+        "average_check": str(place.average_check) if place.average_check is not None else None,
+        "travel_time_minutes": place.travel_time_minutes,
+        "image_url": image_url,
+    }
+
+
 def _event_card_payload(request, event):
     sessions = list(event.sessions.order_by("starts_at"))
     first_session = sessions[0] if sessions else None
@@ -1626,6 +1701,7 @@ def _event_card_payload(request, event):
         "event_id": event.event_id,
         "title": event.title,
         "status": event.status,
+        "moderation_comment": event.moderation_comment or "",
         "description": event.description or "",
         "category": event.category.name if event.category else None,
         "venue_name": event.venue.name if event.venue else None,
@@ -1640,7 +1716,7 @@ def _event_card_payload(request, event):
 def _event_detail_payload(request, event):
     event = (
         Event.objects.select_related("category", "venue")
-        .prefetch_related("sessions__ticket_types", "images")
+        .prefetch_related("sessions__ticket_types", "images", "venue__nearby_places")
         .get(pk=event.pk)
     )
     sessions_payload = []
@@ -1671,10 +1747,15 @@ def _event_detail_payload(request, event):
         }
         for image in event.images.filter(sort_order__gt=0).order_by("sort_order", "image_id")
     ]
+    nearby_places_payload = [
+        _nearby_place_payload(request, place)
+        for place in event.venue.nearby_places.all().order_by("place_id")
+    ] if event.venue_id else []
     return {
         "event_id": event.event_id,
         "title": event.title,
         "status": event.status,
+        "moderation_comment": event.moderation_comment or "",
         "description": event.description or "",
         "age_min": event.age_min,
         "age_max": event.age_max,
@@ -1685,6 +1766,7 @@ def _event_detail_payload(request, event):
         "cover_image_url": _event_cover_url(request, event),
         "sessions": sessions_payload,
         "images": images_payload,
+        "nearby_places": nearby_places_payload,
     }
 
 
@@ -1699,6 +1781,15 @@ def _normalize_status(raw_status):
     }:
         return Event.STATUS_DRAFT
     return status
+
+
+def _organizer_requested_event_status(raw_status):
+    requested_status = _normalize_status(raw_status)
+    if requested_status in {Event.STATUS_PUBLISHED, Event.STATUS_ON_MODERATION}:
+        return Event.STATUS_ON_MODERATION
+    if requested_status == Event.STATUS_ARCHIVED:
+        return Event.STATUS_ARCHIVED
+    return Event.STATUS_DRAFT
 
 
 def _build_event_relations(body):
@@ -1787,7 +1878,7 @@ def _create_or_update_event_from_body(profile, body, event=None):
 
     category, venue = _build_event_relations(body)
     description = (body.get("description") or "").strip() or None
-    status = _normalize_status(body.get("status"))
+    status = _organizer_requested_event_status(body.get("status"))
     age_min = body.get("age_min")
     age_max = body.get("age_max")
     if age_min in ("", None):
@@ -1803,6 +1894,9 @@ def _create_or_update_event_from_body(profile, body, event=None):
     event.title = title
     event.description = description
     event.status = status
+    if status == Event.STATUS_ON_MODERATION:
+        event.moderation_comment = None
+        event.moderated_by_admin = None
     event.age_min = age_min
     event.age_max = age_max
     event.save()
@@ -1810,9 +1904,9 @@ def _create_or_update_event_from_body(profile, body, event=None):
     starts_at = (body.get("starts_at") or "").strip()
     sessions_payload = _parse_sessions_payload(body.get("sessions"), starts_at)
     ticket_types_payload = body.get("ticket_types") or []
-    if status == Event.STATUS_PUBLISHED and not sessions_payload:
+    if status == Event.STATUS_ON_MODERATION and not sessions_payload:
         return None, JsonResponse(
-            {"error": "At least one session is required to publish an event"},
+            {"error": "At least one session is required to send an event to moderation"},
             status=400,
         )
 
@@ -1820,6 +1914,198 @@ def _create_or_update_event_from_body(profile, body, event=None):
         event.sessions.all().delete()
     _create_event_sessions_and_tickets(event, sessions_payload, ticket_types_payload)
     return event, None
+
+
+@require_GET
+def admin_moderation_events(request):
+    token_payload, err = _require_admin_token(request)
+    if err:
+        return err
+
+    events = (
+        Event.objects.filter(status=Event.STATUS_ON_MODERATION)
+        .select_related("category", "venue", "organizer__organizer_account")
+        .prefetch_related("sessions__ticket_types", "images")
+        .order_by("event_id")
+    )
+    items = []
+    for event in events:
+        detail = _event_detail_payload(request, event)
+        detail["organizer"] = {
+            "organizer_id": event.organizer_id,
+            "display_name": event.organizer.display_name,
+            "login": event.organizer.organizer_account.email
+            or event.organizer.organizer_account.phone
+            or "",
+        }
+        items.append(detail)
+    return JsonResponse({"items": items})
+
+
+@csrf_exempt
+@require_POST
+def admin_moderation_event_review(request, event_id):
+    token_payload, err = _require_admin_token(request)
+    if err:
+        return err
+
+    body = _parse_json_body(request)
+    if body is None:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    action = (body.get("action") or "").strip().lower()
+    admin_comment = (body.get("moderation_comment") or "").strip()
+    if action not in {"publish", "reject"}:
+        return JsonResponse({"error": "action must be publish or reject"}, status=400)
+    if action == "reject" and not admin_comment:
+        return JsonResponse({"error": "moderation_comment is required for rejection"}, status=400)
+
+    event = (
+        Event.objects.filter(event_id=event_id, status=Event.STATUS_ON_MODERATION)
+        .select_related("category", "venue")
+        .first()
+    )
+    if not event:
+        return JsonResponse({"error": "Event not found"}, status=404)
+
+    admin = AdminAccount.objects.filter(admin_id=token_payload.get("id")).first()
+    if not admin:
+        return JsonResponse({"error": "Admin account not found"}, status=404)
+
+    if action == "publish":
+        event.status = Event.STATUS_PUBLISHED
+        event.moderation_comment = None
+        event.published_at = timezone.now()
+    else:
+        event.status = Event.STATUS_REJECTED
+        event.moderation_comment = admin_comment
+    event.moderated_by_admin = admin
+    event.save(update_fields=["status", "moderation_comment", "published_at", "moderated_by_admin"])
+
+    return JsonResponse(_event_detail_payload(request, event))
+
+
+@require_GET
+def admin_nearby_places(request):
+    token_payload, err = _require_admin_token(request)
+    if err:
+        return err
+
+    places = (
+        NearbyPlace.objects.select_related("venue")
+        .order_by("-place_id")
+    )
+    venues = Venue.objects.order_by("city", "name", "address")
+    return JsonResponse(
+        {
+            "items": [_nearby_place_payload(request, place) | {
+                "venue_name": place.venue.name,
+                "venue_city": place.venue.city,
+                "venue_address": place.venue.address,
+            } for place in places],
+            "venues": [
+                {
+                    "venue_id": venue.venue_id,
+                    "name": venue.name,
+                    "city": venue.city,
+                    "address": venue.address,
+                    "label": f"{venue.city} · {venue.name}",
+                }
+                for venue in venues
+            ],
+        }
+    )
+
+
+@csrf_exempt
+@require_POST
+def admin_create_nearby_place(request):
+    token_payload, err = _require_admin_token(request)
+    if err:
+        return err
+
+    venue_id = request.POST.get("venue_id")
+    title = (request.POST.get("title") or "").strip()
+    description = (request.POST.get("description") or "").strip()
+    working_hours = (request.POST.get("working_hours") or "").strip()
+    average_check = (request.POST.get("average_check") or "").strip()
+    travel_time_minutes = (request.POST.get("travel_time_minutes") or "").strip()
+    image = request.FILES.get("image")
+
+    if not venue_id or not str(venue_id).isdigit():
+        return JsonResponse({"error": "venue_id is required"}, status=400)
+    if not title:
+        return JsonResponse({"error": "title is required"}, status=400)
+
+    venue = Venue.objects.filter(venue_id=int(venue_id)).first()
+    if not venue:
+        return JsonResponse({"error": "Venue not found"}, status=404)
+
+    place = NearbyPlace(
+        venue=venue,
+        title=title,
+        description=description or None,
+        working_hours=working_hours or None,
+        average_check=average_check or None,
+        travel_time_minutes=travel_time_minutes or None,
+        image=image,
+    )
+    place.save()
+    payload = _nearby_place_payload(request, place)
+    payload["venue_name"] = venue.name
+    payload["venue_city"] = venue.city
+    payload["venue_address"] = venue.address
+    return JsonResponse(payload, status=201)
+
+
+@csrf_exempt
+@require_http_methods(["POST", "DELETE"])
+def admin_nearby_place_detail(request, place_id):
+    token_payload, err = _require_admin_token(request)
+    if err:
+        return err
+
+    place = NearbyPlace.objects.select_related("venue").filter(place_id=place_id).first()
+    if not place:
+        return JsonResponse({"error": "Nearby place not found"}, status=404)
+
+    if request.method == "DELETE":
+        place.delete()
+        return JsonResponse({"ok": True})
+
+    venue_id = request.POST.get("venue_id")
+    title = (request.POST.get("title") or "").strip()
+    description = (request.POST.get("description") or "").strip()
+    working_hours = (request.POST.get("working_hours") or "").strip()
+    average_check = (request.POST.get("average_check") or "").strip()
+    travel_time_minutes = (request.POST.get("travel_time_minutes") or "").strip()
+    image = request.FILES.get("image")
+    clear_image = (request.POST.get("clear_image") or "").strip() in {"1", "true", "True"}
+
+    if venue_id:
+        if not str(venue_id).isdigit():
+            return JsonResponse({"error": "venue_id is invalid"}, status=400)
+        venue = Venue.objects.filter(venue_id=int(venue_id)).first()
+        if not venue:
+            return JsonResponse({"error": "Venue not found"}, status=404)
+        place.venue = venue
+    if title:
+        place.title = title
+    place.description = description or None
+    place.working_hours = working_hours or None
+    place.average_check = average_check or None
+    place.travel_time_minutes = travel_time_minutes or None
+    if clear_image:
+        place.image.delete(save=False)
+        place.image = None
+    if image:
+        place.image = image
+    place.save()
+    payload = _nearby_place_payload(request, place)
+    payload["venue_name"] = place.venue.name
+    payload["venue_city"] = place.venue.city
+    payload["venue_address"] = place.venue.address
+    return JsonResponse(payload)
 
 
 @csrf_exempt
