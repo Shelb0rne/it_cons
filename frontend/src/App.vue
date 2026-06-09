@@ -16,7 +16,7 @@ function loadAuth() {
 
 const auth = ref(loadAuth());
 const loginForm = ref({ login: "", password: "" });
-const registerForm = ref({ full_name: "", login: "", password: "" });
+const registerForm = ref({ full_name: "", login: "", password: "", user_type: "user" });
 const loginError = ref("");
 const loginLoading = ref(false);
 const registerError = ref("");
@@ -1397,6 +1397,7 @@ async function submitRegister() {
         full_name: registerForm.value.full_name,
         login: registerForm.value.login,
         password: registerForm.value.password,
+        user_type: registerForm.value.user_type,
       }),
     });
     const payload = await response.json();
@@ -1409,7 +1410,7 @@ async function submitRegister() {
       role: payload.user.role,
       login: payload.user.login,
     });
-    registerForm.value = { full_name: "", login: "", password: "" };
+    registerForm.value = { full_name: "", login: "", password: "", user_type: "user" };
     const nextPath = popPendingAuthRedirect();
     navigate(nextPath || "/cabinet");
   } catch (error) {
@@ -3038,16 +3039,23 @@ onUnmounted(() => {
       <section class="auth-card">
         <h1>Регистрация</h1>
         <label>
-          ФИО
+          Тип аккаунта
+          <select v-model="registerForm.user_type">
+            <option value="user">Родитель</option>
+            <option value="organizer">Организатор</option>
+          </select>
+        </label>
+        <label>
+          {{ registerForm.user_type === "organizer" ? "Название компании" : "ФИО" }}
           <input v-model="registerForm.full_name" type="text" autocomplete="off" />
         </label>
         <label>
           Логин
           <input
             v-model="registerForm.login"
-            type="text"
+            :type="registerForm.user_type === 'organizer' ? 'email' : 'text'"
             autocomplete="off"
-            placeholder="email или телефон"
+            :placeholder="registerForm.user_type === 'organizer' ? 'email компании' : 'email или телефон'"
           />
         </label>
         <label>
@@ -5215,7 +5223,8 @@ onUnmounted(() => {
   font-size: 20px;
 }
 
-.auth-card input {
+.auth-card input,
+.auth-card select {
   border: 1px solid #ddd;
   border-radius: 10px;
   padding: 10px 12px;

@@ -726,9 +726,12 @@ def register_view(request):
     full_name = (payload.get("full_name") or "").strip()
     login = (payload.get("login") or "").strip()
     password = payload.get("password") or ""
+    user_type = (payload.get("user_type") or "user").strip().lower()
 
     if not full_name or not login or not password:
         return JsonResponse({"error": "full_name, login and password are required"}, status=400)
+    if user_type not in {"user", "organizer"}:
+        return JsonResponse({"error": "user_type must be 'user' or 'organizer'"}, status=400)
 
     if "@" in login:
         email = login
@@ -736,6 +739,48 @@ def register_view(request):
     else:
         email = None
         phone = login
+
+    if AdminAccount.objects.filter(email__iexact=login).exists():
+        return JsonResponse({"error": "Account with this login already exists"}, status=409)
+
+    if user_type == "organizer":
+        if not email:
+            return JsonResponse(
+                {"error": "Organizer registration requires email login"},
+                status=400,
+            )
+        if OrganizerAccount.objects.filter(email__iexact=email).exists():
+            return JsonResponse({"error": "Organizer with this email already exists"}, status=409)
+        if UserAccount.objects.filter(email__iexact=email).exists():
+            return JsonResponse({"error": "User with this email already exists"}, status=409)
+
+        organizer = OrganizerAccount.objects.create(
+            email=email,
+            phone=None,
+            password_hash=make_password(password),
+            status=OrganizerAccount.STATUS_ACTIVE,
+        )
+        OrganizerProfile.objects.create(
+            organizer_account=organizer,
+            display_name=full_name,
+            contact_person=full_name,
+        )
+
+        token_payload = {
+            "role": "organizer",
+            "id": organizer.organizer_account_id,
+            "login": organizer.email,
+        }
+        token = _issue_token(token_payload)
+
+        return JsonResponse(
+            {
+                "token": token,
+                "user": token_payload,
+                "full_name": full_name,
+            },
+            status=201,
+        )
 
     parts = full_name.split()
     first_name = parts[0]
@@ -745,6 +790,10 @@ def register_view(request):
         return JsonResponse({"error": "User with this email already exists"}, status=409)
     if phone and UserAccount.objects.filter(phone=phone).exists():
         return JsonResponse({"error": "User with this phone already exists"}, status=409)
+    if email and OrganizerAccount.objects.filter(email__iexact=email).exists():
+        return JsonResponse({"error": "Organizer with this email already exists"}, status=409)
+    if phone and OrganizerAccount.objects.filter(phone=phone).exists():
+        return JsonResponse({"error": "Organizer with this phone already exists"}, status=409)
 
     account = UserAccount.objects.create(
         email=email,

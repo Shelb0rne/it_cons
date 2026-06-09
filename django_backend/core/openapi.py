@@ -102,6 +102,11 @@ def _schema(request):
                         "full_name": {"type": "string"},
                         "login": {"type": "string"},
                         "password": {"type": "string"},
+                        "user_type": {
+                            "type": "string",
+                            "enum": ["user", "organizer"],
+                            "default": "user",
+                        },
                     },
                 },
                 "ReservationCreateRequest": {
@@ -236,7 +241,7 @@ def _fill_paths(schema):
         "/api/events/{event_id}": {"get": _op("Public", "Get event details", _responses([(200, "Event details", "#/components/schemas/EventDetailResponse")], _errs(404, 500)), parameters=[_path_int("event_id")])},
         "/api/events/{event_id}/seat-map": {"get": _op("Public", "Get seat map", _responses([(200, "Seat map", "#/components/schemas/SeatMapResponse")], _errs(400, 404, 500)), parameters=[_path_int("event_id"), _query("session_id", "integer")])},
         "/api/auth/login": {"post": _op("Auth", "Login", _responses([(200, "Token", "#/components/schemas/AuthTokenResponse")], _errs(400, 401, 403, 500)), request_body=_json_body("#/components/schemas/LoginRequest"))},
-        "/api/auth/register": {"post": _op("Auth", "Register user", _responses([(201, "Registered", "#/components/schemas/AuthTokenResponse")], _errs(400, 409, 500)), request_body=_json_body("#/components/schemas/RegisterRequest"))},
+        "/api/auth/register": {"post": _op("Auth", "Register user or organizer", _responses([(201, "Registered", "#/components/schemas/AuthTokenResponse")], _errs(400, 409, 500)), request_body=_json_body("#/components/schemas/RegisterRequest"))},
         "/api/auth/me": {"get": _op("Auth", "Get current account", _responses([(200, "Account", "#/components/schemas/AuthMeResponse")], _errs(400, 401, 404, 500)), security=bearer)},
         "/api/user/profile": {
             "get": _op("User", "Get profile", _responses([(200, "Profile", "#/components/schemas/UserProfileResponse")], _errs(401, 403, 404, 500)), security=bearer),
